@@ -35,9 +35,13 @@
 #include <stdio.h>
 #include "Limelight.h"
 
+#ifdef LC_LOG
 #define Limelog(s, ...) \
     if (ListenerCallbacks.logMessage) \
         ListenerCallbacks.logMessage(s, ##__VA_ARGS__)
+#else
+#define Limelog(s, ...)
+#endif
 
 #if defined(LC_WINDOWS)
 #include <crtdbg.h>

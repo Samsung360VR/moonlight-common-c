@@ -90,9 +90,17 @@ int recvUdpSocket(SOCKET s, char* buffer, int size, int useSelect) {
         // for each packet.
         err = (int)recv(s, buffer, size, 0);
         if (err < 0 &&
+#if defined(__EMSCRIPTEN__)
+// Temporary workaround - with newer Emscripten, errno codes are not
+// compatible with POSIX ones
+// TODO(j.gajownik2) Define mapping errno mapping WASI -> POSIX
+                (LastSocketError() == __WASI_ERRNO_AGAIN ||
+                 LastSocketError() == __WASI_ERRNO_INTR)) {
+#else
                 (LastSocketError() == EWOULDBLOCK ||
                  LastSocketError() == EINTR ||
                  LastSocketError() == EAGAIN)) {
+#endif
             // Return 0 for timeout
             return 0;
         }
@@ -185,8 +193,10 @@ SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, 
     SOCKET s;
     struct sockaddr_in6 addr;
     int err;
+#if !defined(__EMSCRIPTEN__)
 #if defined(LC_DARWIN) || defined(FIONBIO)
     int val;
+#endif
 #endif
 
     s = socket(dstaddr->ss_family, SOCK_STREAM, IPPROTO_TCP);
@@ -201,10 +211,12 @@ SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, 
     setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, (char*)&val, sizeof(val));
 #endif
     
+#if !defined(__EMSCRIPTEN__)
 #ifdef FIONBIO
     // Enable non-blocking I/O for connect timeout support
     val = 1;
     ioctlsocket(s, FIONBIO, &val);
+#endif
 #endif
 
     // Start connection
@@ -215,6 +227,7 @@ SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, 
         err = (int)LastSocketError();
     }
     
+#if !defined(__EMSCRIPTEN__)
 #ifdef FIONBIO
     {
         fd_set writefds, exceptfds;
@@ -259,6 +272,7 @@ SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, 
         val = 0;
         ioctlsocket(s, FIONBIO, &val);
     }
+#endif
 #endif
     
     if (err != 0) {
