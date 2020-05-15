@@ -6,6 +6,9 @@
 #define RCV_BUFFER_SIZE_MIN  32767
 #define RCV_BUFFER_SIZE_STEP 16384
 
+#define TCPv4_MSS 536
+#define TCPv6_MSS 1220
+
 void addrToUrlSafeString(struct sockaddr_storage* addr, char* string)
 {
     char addrstr[INET6_ADDRSTRLEN];
@@ -122,11 +125,7 @@ SOCKET bindUdpSocket(int addrfamily, int bufferSize) {
     struct sockaddr_storage addr;
     int err;
 
-#ifndef __vita__
     LC_ASSERT(addrfamily == AF_INET || addrfamily == AF_INET6);
-#else
-    LC_ASSERT(addrfamily == AF_INET);
-#endif
 
     s = socket(addrfamily, SOCK_DGRAM, IPPROTO_UDP);
     if (s == INVALID_SOCKET) {
@@ -189,15 +188,26 @@ SOCKET bindUdpSocket(int addrfamily, int bufferSize) {
     return s;
 }
 
+int setSocketNonBlocking(SOCKET s, int val) {
+#if defined(__EMSCRIPTEN__)
+    return SOCKET_ERROR;
+#else
+#if defined(__vita__)
+    return setsockopt(s, SOL_SOCKET, SO_NONBLOCK, (char*)&val, sizeof(val));
+#elif defined(FIONBIO)
+    return ioctlsocket(s, FIONBIO, &val);
+#else
+    return SOCKET_ERROR;
+#endif
+#endif
+}
+
 SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, unsigned short port, int timeoutSec) {
     SOCKET s;
     struct sockaddr_in6 addr;
     int err;
-#if !defined(__EMSCRIPTEN__)
-#if defined(LC_DARWIN) || defined(FIONBIO)
+    int nonBlocking;
     int val;
-#endif
-#endif
 
     s = socket(dstaddr->ss_family, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) {
@@ -210,14 +220,51 @@ SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, 
     val = 1;
     setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, (char*)&val, sizeof(val));
 #endif
-    
-#if !defined(__EMSCRIPTEN__)
-#ifdef FIONBIO
-    // Enable non-blocking I/O for connect timeout support
+
+    // Some broken routers/firewalls (or routes with multiple broken routers) may result in TCP packets
+    // being dropped without without us receiving an ICMP Fragmentation Needed packet. For example,
+    // a router can elect to drop rather than fragment even without DF set. A misconfigured firewall
+    // or router on the path back to us may block the ICMP Fragmentation Needed packet required for
+    // PMTUD to work and thus we end up with a black hole route. Some OSes recover from this better
+    // than others, but we can avoid the issue altogether by capping our MSS to the value mandated
+    // by RFC 879 and RFC 2460.
+    //
+    // Note: This only changes the max packet size we can *receive* from the host PC.
+    // We still must split our own sends into smaller chunks with TCP_NODELAY enabled to
+    // avoid MTU issues on the way out to to the target.
+#if defined(LC_WINDOWS)
+    // Windows doesn't support setting TCP_MAXSEG but IP_PMTUDISC_DONT forces the MSS to the protocol
+    // minimum which is what we want here. Linux doesn't do this (disabling PMTUD just avoids setting DF).
+    if (dstaddr->ss_family == AF_INET) {
+        val = IP_PMTUDISC_DONT;
+        if (setsockopt(s, IPPROTO_IP, IP_MTU_DISCOVER, (char*)&val, sizeof(val)) < 0) {
+            Limelog("setsockopt(IP_MTU_DISCOVER, IP_PMTUDISC_DONT) failed: %d\n", val, (int)LastSocketError());
+        }
+    }
+    else {
+        val = IP_PMTUDISC_DONT;
+        if (setsockopt(s, IPPROTO_IPV6, IPV6_MTU_DISCOVER, (char*)&val, sizeof(val)) < 0) {
+            Limelog("setsockopt(IPV6_MTU_DISCOVER, IP_PMTUDISC_DONT) failed: %d\n", val, (int)LastSocketError());
+        }
+    }
+#elif defined(TCP_NOOPT)
+    // On BSD-based OSes (including macOS/iOS), TCP_NOOPT seems to be the only way to
+    // restrict MSS to the minimum. It strips all options out of the SYN packet which
+    // forces the remote party to fall back to the minimum MSS. TCP_MAXSEG doesn't seem
+    // to work correctly for outbound connections on macOS/iOS.
     val = 1;
-    ioctlsocket(s, FIONBIO, &val);
+    if (setsockopt(s, IPPROTO_TCP, TCP_NOOPT, (char*)&val, sizeof(val)) < 0) {
+        Limelog("setsockopt(TCP_NOOPT, %d) failed: %d\n", val, (int)LastSocketError());
+    }
+#elif defined(TCP_MAXSEG)
+    val = dstaddr->ss_family == AF_INET ? TCPv4_MSS : TCPv6_MSS;
+    if (setsockopt(s, IPPROTO_TCP, TCP_MAXSEG, (char*)&val, sizeof(val)) < 0) {
+        Limelog("setsockopt(TCP_MAXSEG, %d) failed: %d\n", val, (int)LastSocketError());
+    }
 #endif
-#endif
+    
+    // Enable non-blocking I/O for connect timeout support
+    nonBlocking = setSocketNonBlocking(s, 1) == 0;
 
     // Start connection
     memcpy(&addr, dstaddr, addrlen);
@@ -227,9 +274,7 @@ SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, 
         err = (int)LastSocketError();
     }
     
-#if !defined(__EMSCRIPTEN__)
-#ifdef FIONBIO
-    {
+    if (nonBlocking) {
         fd_set writefds, exceptfds;
         struct timeval tv;
         
@@ -255,7 +300,7 @@ SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, 
             // select() timed out
             Limelog("select() timed out after %d seconds\n", timeoutSec);
             closeSocket(s);
-            SetLastSocketError(EWOULDBLOCK);
+            SetLastSocketError(ETIMEDOUT);
             return INVALID_SOCKET;
         }
         else if (FD_ISSET(s, &writefds) || FD_ISSET(s, &exceptfds)) {
@@ -269,11 +314,8 @@ SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, 
         }
         
         // Disable non-blocking I/O now that the connection is established
-        val = 0;
-        ioctlsocket(s, FIONBIO, &val);
+        setSocketNonBlocking(s, 0);
     }
-#endif
-#endif
     
     if (err != 0) {
         Limelog("connect() failed: %d\n", err);
@@ -283,6 +325,25 @@ SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, 
     }
 
     return s;
+}
+
+// See TCP_MAXSEG note in connectTcpSocket() above for more information.
+// TCP_NODELAY must be enabled on the socket for this function to work!
+int sendMtuSafe(SOCKET s, char* buffer, int size) {
+    int bytesSent = 0;
+
+    while (bytesSent < size) {
+        int bytesToSend = size - bytesSent > TCPv4_MSS ?
+                          TCPv4_MSS : size - bytesSent;
+
+        if (send(s, &buffer[bytesSent], bytesToSend, 0) < 0) {
+            return -1;
+        }
+
+        bytesSent += bytesToSend;
+    }
+
+    return bytesSent;
 }
 
 int enableNoDelay(SOCKET s) {
@@ -319,8 +380,9 @@ int resolveHostName(const char* host, int family, int tcpTestPort, struct sockad
     }
     
     for (currentAddr = res; currentAddr != NULL; currentAddr = currentAddr->ai_next) {
-        // Use the test port to ensure this address is working
-        if (tcpTestPort != 0) {
+        // Use the test port to ensure this address is working if there
+        // are multiple addresses for this host name
+        if (tcpTestPort != 0 && res->ai_next != NULL) {
             SOCKET testSocket = connectTcpSocket((struct sockaddr_storage*)currentAddr->ai_addr,
                                                  currentAddr->ai_addrlen,
                                                  tcpTestPort,
@@ -346,7 +408,6 @@ int resolveHostName(const char* host, int family, int tcpTestPort, struct sockad
     return -1;
 }
 
-#ifndef __vita__
 int isInSubnetV6(struct sockaddr_in6* sin6, unsigned char* subnet, int prefixLength) {
     int i;
     
@@ -359,7 +420,6 @@ int isInSubnetV6(struct sockaddr_in6* sin6, unsigned char* subnet, int prefixLen
     
     return 1;
 }
-#endif
 
 int isPrivateNetworkAddress(struct sockaddr_storage* address) {
 
@@ -387,7 +447,6 @@ int isPrivateNetworkAddress(struct sockaddr_storage* address) {
             return 1;
         }
     }
-#ifndef __vita__
     else if (address->ss_family == AF_INET6) {
         struct sockaddr_in6* sin6 = (struct sockaddr_in6*)address;
         static unsigned char linkLocalPrefix[] = {0xfe, 0x80};
@@ -407,7 +466,6 @@ int isPrivateNetworkAddress(struct sockaddr_storage* address) {
             return 1;
         }
     }
-#endif
 
     return 0;
 }

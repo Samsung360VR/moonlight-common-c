@@ -75,6 +75,7 @@ static void ReceiveThreadProc(void* context) {
     char* buffer;
     int queueStatus;
     int useSelect;
+    int waitingForVideoMs;
 
     receiveSize = StreamConfig.packetSize + MAX_RTP_HEADER_SIZE;
     bufferSize = receiveSize + sizeof(RTPFEC_QUEUE_ENTRY);
@@ -89,6 +90,7 @@ static void ReceiveThreadProc(void* context) {
         useSelect = 0;
     }
 
+    waitingForVideoMs = 0;
     while (!PltIsThreadInterrupted(&receiveThread)) {
         PRTP_PACKET packet;
 
@@ -108,17 +110,33 @@ static void ReceiveThreadProc(void* context) {
             break;
         }
         else if  (err == 0) {
+            if (!receivedDataFromPeer) {
+                // If we wait many seconds without ever receiving a video packet,
+                // assume something is broken and terminate the connection.
+                waitingForVideoMs += UDP_RECV_POLL_TIMEOUT_MS;
+                if (waitingForVideoMs >= FIRST_FRAME_TIMEOUT_SEC * 1000) {
+                    Limelog("Terminating connection due to lack of video traffic\n");
+                    ListenerCallbacks.connectionTerminated(ML_ERROR_NO_VIDEO_TRAFFIC);
+                    break;
+                }
+            }
+            
             // Receive timed out; try again
             continue;
         }
 
-        // We've received data, so we can stop sending our ping packets
-        // as quickly, since we're now just keeping the NAT session open.
-        receivedDataFromPeer = 1;
+        if (!receivedDataFromPeer) {
+            // We've received data, so we can stop sending our ping packets
+            // as quickly, since we're now just keeping the NAT session open.
+            receivedDataFromPeer = 1;
+            Limelog("Received first video packet after %d ms\n", waitingForVideoMs);
+        }
 
-        // RTP sequence number must be in host order for the RTP queue
+        // Convert fields to host byte-order
         packet = (PRTP_PACKET)&buffer[0];
         packet->sequenceNumber = htons(packet->sequenceNumber);
+        packet->timestamp = htonl(packet->timestamp);
+        packet->ssrc = htonl(packet->ssrc);
 
         queueStatus = RtpfAddPacket(&rtpQueue, packet, err, (PRTPFEC_QUEUE_ENTRY)&buffer[receiveSize]);
 
@@ -160,6 +178,10 @@ int readFirstFrame(void) {
 
 // Terminate the video stream
 void stopVideoStream(void) {
+    if (!receivedDataFromPeer) {
+        Limelog("No video traffic was ever received from the host!\n");
+    }
+
     VideoCallbacks.stop();
 
     // Wake up client code that may be waiting on the decode unit queue

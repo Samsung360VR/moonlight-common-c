@@ -26,32 +26,6 @@ static int receivedDataFromPeer;
 // for longer than normal.
 #define RTP_RECV_BUFFER (64 * 1024)
 
-#define SAMPLE_RATE 48000
-
-static OPUS_MULTISTREAM_CONFIGURATION opusStereoConfig = {
-    .sampleRate = SAMPLE_RATE,
-    .channelCount = 2,
-    .streams = 1,
-    .coupledStreams = 1,
-    .mapping = {0, 1}
-};
-
-static OPUS_MULTISTREAM_CONFIGURATION opus51SurroundConfig = {
-    .sampleRate = SAMPLE_RATE,
-    .channelCount = 6,
-    .streams = 4,
-    .coupledStreams = 2,
-    .mapping = {0, 4, 1, 5, 2, 3}
-};
-
-static OPUS_MULTISTREAM_CONFIGURATION opus51HighSurroundConfig = {
-        .sampleRate = SAMPLE_RATE,
-        .channelCount = 6,
-        .streams = 6,
-        .coupledStreams = 0,
-        .mapping = {0, 1, 2, 3, 4, 5}
-};
-
 typedef struct _QUEUED_AUDIO_PACKET {
     // data must remain at the front
     char data[MAX_PACKET_SIZE];
@@ -158,6 +132,7 @@ static void ReceiveThreadProc(void* context) {
     int queueStatus;
     int useSelect;
     int packetsToDrop = 500 / AudioPacketDuration;
+    int waitingForAudioMs;
 
     packet = NULL;
 
@@ -170,6 +145,7 @@ static void ReceiveThreadProc(void* context) {
         useSelect = 0;
     }
 
+    waitingForAudioMs = 0;
     while (!PltIsThreadInterrupted(&receiveThread)) {
         if (packet == NULL) {
             packet = (PQUEUED_AUDIO_PACKET)malloc(sizeof(*packet));
@@ -188,6 +164,10 @@ static void ReceiveThreadProc(void* context) {
         }
         else if (packet->size == 0) {
             // Receive timed out; try again
+            
+            if (!receivedDataFromPeer) {
+                waitingForAudioMs += UDP_RECV_POLL_TIMEOUT_MS;
+            }
 
             // If we hit this path, there are no queued audio packets on the host PC,
             // so we don't need to drop anything.
@@ -206,9 +186,12 @@ static void ReceiveThreadProc(void* context) {
             continue;
         }
 
-        // We've received data, so we can stop sending our ping packets
-        // as quickly, since we're now just keeping the NAT session open.
-        receivedDataFromPeer = 1;
+        if (!receivedDataFromPeer) {
+            // We've received data, so we can stop sending our ping packets
+            // as quickly, since we're now just keeping the NAT session open.
+            receivedDataFromPeer = 1;
+            Limelog("Received first audio packet after %d ms\n", waitingForAudioMs);
+        }
 
         // GFE accumulates audio samples before we are ready to receive them,
         // so we will drop the first 100 packets to avoid accumulating latency
@@ -218,8 +201,10 @@ static void ReceiveThreadProc(void* context) {
             continue;
         }
 
-        // RTP sequence number must be in host order for the RTP queue
+        // Convert fields to host byte-order
         rtp->sequenceNumber = htons(rtp->sequenceNumber);
+        rtp->timestamp = htonl(rtp->timestamp);
+        rtp->ssrc = htonl(rtp->ssrc);
 
         queueStatus = RtpqAddPacket(&rtpReorderQueue, (PRTP_PACKET)packet, &packet->q.rentry);
         if (RTPQ_HANDLE_NOW(queueStatus)) {
@@ -285,6 +270,10 @@ static void DecoderThreadProc(void* context) {
 }
 
 void stopAudioStream(void) {
+    if (!receivedDataFromPeer) {
+        Limelog("No audio traffic was ever received from the host!\n");
+    }
+
     AudioCallbacks.stop();
 
     PltInterruptThread(&udpPingThread);
@@ -319,22 +308,16 @@ int startAudioStream(void* audioContext, int arFlags) {
     int err;
     OPUS_MULTISTREAM_CONFIGURATION chosenConfig;
 
-    // TODO: Get these from RTSP ANNOUNCE surround-params
-    if (StreamConfig.audioConfiguration == AUDIO_CONFIGURATION_STEREO) {
-        chosenConfig = opusStereoConfig;
-    }
-    else if (StreamConfig.audioConfiguration == AUDIO_CONFIGURATION_51_SURROUND) {
-        if (HighQualitySurroundEnabled) {
-            LC_ASSERT(HighQualitySurroundSupported);
-            chosenConfig = opus51HighSurroundConfig;
-        }
-        else {
-            chosenConfig = opus51SurroundConfig;
-        }
+    if (HighQualitySurroundEnabled) {
+        LC_ASSERT(HighQualitySurroundSupported);
+        LC_ASSERT(HighQualityOpusConfig.channelCount != 0);
+        LC_ASSERT(HighQualityOpusConfig.streams != 0);
+        chosenConfig = HighQualityOpusConfig;
     }
     else {
-        Limelog("Invalid audio configuration: %d\n", StreamConfig.audioConfiguration);
-        return -1;
+        LC_ASSERT(NormalQualityOpusConfig.channelCount != 0);
+        LC_ASSERT(NormalQualityOpusConfig.streams != 0);
+        chosenConfig = NormalQualityOpusConfig;
     }
 
     chosenConfig.samplesPerFrame = 48 * AudioPacketDuration;
@@ -405,4 +388,8 @@ int startAudioStream(void* audioContext, int arFlags) {
 
 int LiGetPendingAudioFrames(void) {
     return LbqGetItemCount(&packetQueue);
+}
+
+int LiGetPendingAudioDuration(void) {
+    return LiGetPendingAudioFrames() * AudioPacketDuration;
 }

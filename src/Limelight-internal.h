@@ -22,6 +22,8 @@ extern int NegotiatedVideoFormat;
 extern volatile int ConnectionInterrupted;
 extern int HighQualitySurroundSupported;
 extern int HighQualitySurroundEnabled;
+extern OPUS_MULTISTREAM_CONFIGURATION NormalQualityOpusConfig;
+extern OPUS_MULTISTREAM_CONFIGURATION HighQualityOpusConfig;
 extern int OriginalVideoBitrate;
 extern int AudioPacketDuration;
 
@@ -39,13 +41,21 @@ extern int AudioPacketDuration;
 
 #define UDP_RECV_POLL_TIMEOUT_MS 100
 
-// At this value, we will request high quality audio unless CAPABILITY_SLOW_OPUS_DECODER
+// At this value or above, we will request high quality audio unless CAPABILITY_SLOW_OPUS_DECODER
 // is set on the audio renderer.
 #define HIGH_AUDIO_BITRATE_THRESHOLD 15000
+
+// Below this value, we will request 20 ms audio frames to reduce bandwidth if the audio
+// renderer sets CAPABILITY_SUPPORTS_ARBITRARY_AUDIO_DURATION.
+#define LOW_AUDIO_BITRATE_TRESHOLD 5000
+
+// Internal macro for checking the magic byte of the audio configuration value
+#define MAGIC_BYTE_FROM_AUDIO_CONFIG(x) ((x) & 0xFF)
 
 int serviceEnetHost(ENetHost* client, ENetEvent* event, enet_uint32 timeoutMs);
 int extractVersionQuadFromString(const char* string, int* quad);
 int isReferenceFrameInvalidationEnabled(void);
+void* extendBuffer(void* ptr, size_t newSize);
 
 void fixupMissingCallbacks(PDECODER_RENDERER_CALLBACKS* drCallbacks, PAUDIO_RENDERER_CALLBACKS* arCallbacks,
     PCONNECTION_LISTENER_CALLBACKS* clCallbacks);

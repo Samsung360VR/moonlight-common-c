@@ -18,6 +18,16 @@ extern "C" {
 #define STREAM_CFG_REMOTE  1
 #define STREAM_CFG_AUTO    2
 
+// Values for the 'colorSpace' field below.
+// Rec. 2020 is only supported with HEVC video streams.
+#define COLORSPACE_REC_601  0
+#define COLORSPACE_REC_709  1
+#define COLORSPACE_REC_2020 2
+
+// Values for the 'colorRange' field below
+#define COLOR_RANGE_LIMITED  0
+#define COLOR_RANGE_FULL     1
+
 typedef struct _STREAM_CONFIGURATION {
     // Dimensions in pixels of the desired video stream
     int width;
@@ -42,7 +52,7 @@ typedef struct _STREAM_CONFIGURATION {
     int streamingRemotely;
 
     // Specifies the channel configuration of the audio stream.
-    // See AUDIO_CONFIGURATION_XXX constants below.
+    // See AUDIO_CONFIGURATION constants and MAKE_AUDIO_CONFIGURATION() below.
     int audioConfiguration;
     
     // Specifies that the client can accept an H.265 video stream
@@ -67,6 +77,14 @@ typedef struct _STREAM_CONFIGURATION {
     // 59.94 Hz would be specified as 5994. This is used by recent versions
     // of GFE for enhanced frame pacing.
     int clientRefreshRateX100;
+
+    // If specified, sets the encoder colorspace to the provided COLORSPACE_*
+    // option (listed above). If not set, the encoder will default to Rec 601.
+    int colorSpace;
+
+    // If specified, sets the encoder color range to the provided COLOR_RANGE_*
+    // option (listed above). If not set, the encoder will default to Limited.
+    int colorRange;
 
     // AES encryption data for the remote input stream. This must be
     // the same as what was passed as rikey and rikeyid
@@ -122,6 +140,11 @@ typedef struct _DECODE_UNIT {
     // shares the same epoch as this value.
     unsigned long long receiveTimeMs;
 
+    // Presentation time in milliseconds with the epoch at the first captured frame.
+    // This can be used to aid frame pacing or to drop old frames that were queued too
+    // long prior to display.
+    unsigned int presentationTimeMs;
+
     // Length of the entire buffer chain in bytes
     int fullLength;
 
@@ -130,10 +153,31 @@ typedef struct _DECODE_UNIT {
 } DECODE_UNIT, *PDECODE_UNIT;
 
 // Specifies that the audio stream should be encoded in stereo (default)
-#define AUDIO_CONFIGURATION_STEREO 0
+#define AUDIO_CONFIGURATION_STEREO MAKE_AUDIO_CONFIGURATION(2, 0x3)
 
 // Specifies that the audio stream should be in 5.1 surround sound if the PC is able
-#define AUDIO_CONFIGURATION_51_SURROUND 1
+#define AUDIO_CONFIGURATION_51_SURROUND MAKE_AUDIO_CONFIGURATION(6, 0x3F)
+
+// Specifies that the audio stream should be in 7.1 surround sound if the PC is able
+#define AUDIO_CONFIGURATION_71_SURROUND MAKE_AUDIO_CONFIGURATION(8, 0x63F)
+
+// Specifies an audio configuration by channel count and channel mask
+// See https://docs.microsoft.com/en-us/windows-hardware/drivers/audio/channel-mask for channelMask values
+// NOTE: Not all combinations are supported by GFE and/or this library.
+#define MAKE_AUDIO_CONFIGURATION(channelCount, channelMask) \
+    (((channelMask) << 16) | (channelCount << 8) | 0xCA)
+
+// Helper macros for retreiving channel count and channel mask from the audio configuration
+#define CHANNEL_COUNT_FROM_AUDIO_CONFIGURATION(x) (((x) >> 8) & 0xFF)
+#define CHANNEL_MASK_FROM_AUDIO_CONFIGURATION(x) (((x) >> 16) & 0xFFFF)
+
+// Helper macro to retreive the surroundAudioInfo parameter value that must be passed in
+// the /launch and /resume HTTPS requests when starting the session.
+#define SURROUNDAUDIOINFO_FROM_AUDIO_CONFIGURATION(x) \
+    (CHANNEL_MASK_FROM_AUDIO_CONFIGURATION(x) << 16 | CHANNEL_COUNT_FROM_AUDIO_CONFIGURATION(x))
+
+// The maximum number of channels supported
+#define AUDIO_CONFIGURATION_MAX_CHANNEL_COUNT 8
 
 // Passed to DecoderRendererSetup to indicate that the following video stream will be
 // in H.264 High Profile.
@@ -170,6 +214,12 @@ typedef struct _DECODE_UNIT {
 // to never request the "high quality" audio preset. If unset, high quality audio will be
 // used with video streams above 15 Mbps.
 #define CAPABILITY_SLOW_OPUS_DECODER 0x8
+
+// If set in the audio renderer capabilities field, this indicates that audio packets
+// may contain more or less than 5 ms of audio. This requires that audio renderers read the
+// samplesPerFrame field in OPUS_MULTISTREAM_CONFIGURATION to calculate the correct decoded
+// buffer size rather than just assuming it will always be 240.
+#define CAPABILITY_SUPPORTS_ARBITRARY_AUDIO_DURATION 0x10
 
 // If set in the video renderer capabilities field, this macro specifies that the renderer
 // supports slicing to increase decoding performance. The parameter specifies the desired
@@ -218,8 +268,10 @@ void LiInitializeVideoCallbacks(PDECODER_RENDERER_CALLBACKS drCallbacks);
 // 1 - Front Right
 // 2 - Center
 // 3 - LFE
-// 4 - Surround Left
-// 5 - Surround Right
+// 4 - Back Left
+// 5 - Back Right
+// 6 - Side Left
+// 7 - Side Right
 //
 // If the mapping order does not match the channel order of the audio renderer, you may swap
 // the values in the mismatched indices until the mapping array matches the desired channel order.
@@ -229,7 +281,7 @@ typedef struct _OPUS_MULTISTREAM_CONFIGURATION {
     int streams;
     int coupledStreams;
     int samplesPerFrame;
-    unsigned char mapping[6];
+    unsigned char mapping[AUDIO_CONFIGURATION_MAX_CHANNEL_COUNT];
 } OPUS_MULTISTREAM_CONFIGURATION, *POPUS_MULTISTREAM_CONFIGURATION;
 
 // This callback initializes the audio renderer. The audio configuration parameter
@@ -287,7 +339,7 @@ typedef void(*ConnListenerStageComplete)(int stage);
 // ConnListenerConnectionTerminated() will not be invoked because the connection was
 // not yet fully established. LiInterruptConnection() and LiStopConnection() may
 // result in this callback being invoked, but it is not guaranteed.
-typedef void(*ConnListenerStageFailed)(int stage, long errorCode);
+typedef void(*ConnListenerStageFailed)(int stage, int errorCode);
 
 // This callback is invoked after the connection is successfully established
 typedef void(*ConnListenerConnectionStarted)(void);
@@ -298,7 +350,18 @@ typedef void(*ConnListenerConnectionStarted)(void);
 // non-zero, it means the termination was probably unexpected (loss of network,
 // crash, or similar conditions). This will not be invoked as a result of a call
 // to LiStopConnection() or LiInterruptConnection().
-typedef void(*ConnListenerConnectionTerminated)(long errorCode);
+typedef void(*ConnListenerConnectionTerminated)(int errorCode);
+
+// This error code is passed to ConnListenerConnectionTerminated() when the stream
+// is being gracefully terminated by the host. It usually means the app on the host
+// PC has exited.
+#define ML_ERROR_GRACEFUL_TERMINATION 0
+
+// This error is passed to ConnListenerConnectionTerminated() if no video data
+// was ever received for this connection after waiting several seconds. It likely
+// indicates a problem with traffic on UDP 47998 due to missing or incorrect
+// firewall or port forwarding rules.
+#define ML_ERROR_NO_VIDEO_TRAFFIC -100
 
 // This callback is invoked to log debug message
 typedef void(*ConnListenerLogMessage)(const char* format, ...);
@@ -323,8 +386,6 @@ typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerStageFailed stageFailed;
     ConnListenerConnectionStarted connectionStarted;
     ConnListenerConnectionTerminated connectionTerminated;
-    void* deprecated1; // was displayMessage()
-    void* deprecated2; // was displayTransientMessage()
     ConnListenerLogMessage logMessage;
     ConnListenerRumble rumble;
     ConnListenerConnectionStatusUpdate connectionStatusUpdate;
@@ -370,8 +431,24 @@ void LiInterruptConnection(void);
 // from the integer passed to the ConnListenerStageXXX callbacks
 const char* LiGetStageName(int stage);
 
-// This function queues a mouse move event to be sent to the remote server.
+// This function queues a relative mouse move event to be sent to the remote server.
 int LiSendMouseMoveEvent(short deltaX, short deltaY);
+
+// This function queues a mouse position update event to be sent to the remote server.
+// This functionality is only reliably supported on GFE 3.20 or later. Earlier versions
+// may not position the mouse correctly.
+//
+// Absolute mouse motion doesn't work in many games, so this mode should not be the default
+// for mice when streaming. It may be desirable as the default touchscreen behavior if the
+// touchscreen is not the primary input method.
+//
+// The x and y values are transformed to host coordinates as if they are from a plane which
+// is referenceWidth by referenceHeight in size. This allows you to provide coordinates that
+// are relative to an arbitrary plane, such as a window, screen, or scaled video view.
+//
+// For example, if you wanted to directly pass window coordinates as x and y, you would set
+// referenceWidth and referenceHeight to your window width and height.
+int LiSendMousePositionEvent(short x, short y, short referenceWidth, short referenceHeight);
 
 // This function queues a mouse button event to be sent to the remote server.
 #define BUTTON_ACTION_PRESS 0x07
@@ -389,6 +466,7 @@ int LiSendMouseButtonEvent(char action, int button);
 #define MODIFIER_SHIFT 0x01
 #define MODIFIER_CTRL 0x02
 #define MODIFIER_ALT 0x04
+#define MODIFIER_META 0x08
 int LiSendKeyboardEvent(short keyCode, char keyAction, char modifiers);
 
 // Button flags
@@ -449,8 +527,14 @@ int LiFindExternalAddressIP4(const char* stunServer, unsigned short stunPort, un
 int LiGetPendingVideoFrames(void);
 
 // Returns the number of queued audio frames ready for delivery. Only relevant
-// if CAPABILITY_DIRECT_SUBMIT is not set for the audio renderer.
+// if CAPABILITY_DIRECT_SUBMIT is not set for the audio renderer. For most uses,
+// LiGetPendingAudioDuration() is probably a better option than this function.
 int LiGetPendingAudioFrames(void);
+
+// Similar to LiGetPendingAudioFrames() except it returns the pending audio in
+// milliseconds rather than frames, which allows callers to be agnostic of the
+// negotiated audio frame duration.
+int LiGetPendingAudioDuration(void);
 
 #ifdef __cplusplus
 }
