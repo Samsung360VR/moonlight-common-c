@@ -21,6 +21,8 @@ static PLT_THREAD receiveThread;
 static PLT_THREAD decoderThread;
 
 static int receivedDataFromPeer;
+static uint64_t firstDataTimeMs;
+static int receivedFullFrame;
 
 // We can't request an IDR frame until the depacketizer knows
 // that a packet was lost. This timeout bounds the time that
@@ -33,6 +35,8 @@ void initializeVideoStream(void) {
     initializeVideoDepacketizer(StreamConfig.packetSize);
     RtpfInitializeQueue(&rtpQueue); //TODO RTP_QUEUE_DELAY
     receivedDataFromPeer = 0;
+    firstDataTimeMs = 0;
+    receivedFullFrame = 0;
 }
 
 // Clean up the video stream
@@ -58,13 +62,7 @@ static void UdpPingThreadProc(void* context) {
             return;
         }
 
-        // Send less frequently if we've received data from our peer
-        if (receivedDataFromPeer) {
-            PltSleepMsInterruptible(&udpPingThread, 5000);
-        }
-        else {
-            PltSleepMsInterruptible(&udpPingThread, 500);
-        }
+        PltSleepMsInterruptible(&udpPingThread, 500);
     }
 }
 
@@ -126,10 +124,20 @@ static void ReceiveThreadProc(void* context) {
         }
 
         if (!receivedDataFromPeer) {
-            // We've received data, so we can stop sending our ping packets
-            // as quickly, since we're now just keeping the NAT session open.
             receivedDataFromPeer = 1;
             Limelog("Received first video packet after %d ms\n", waitingForVideoMs);
+
+            firstDataTimeMs = PltGetMillis();
+        }
+
+        if (!receivedFullFrame) {
+            uint64_t now = PltGetMillis();
+
+            if (now - firstDataTimeMs >= FIRST_FRAME_TIMEOUT_SEC * 1000) {
+                Limelog("Terminating connection due to lack of a successful video frame\n");
+                ListenerCallbacks.connectionTerminated(ML_ERROR_NO_VIDEO_FRAME);
+                break;
+            }
         }
 
         // Convert fields to host byte-order
@@ -151,6 +159,15 @@ static void ReceiveThreadProc(void* context) {
     }
 }
 
+void submitFrame(PQUEUED_DECODE_UNIT qdu) {
+    // Pass the frame to the decoder
+    int ret = VideoCallbacks.submitDecodeUnit(&qdu->decodeUnit);
+    completeQueuedDecodeUnit(qdu, ret);
+
+    // Remember that we got a full frame successfully
+    receivedFullFrame = 1;
+}
+
 // Decoder thread proc
 static void DecoderThreadProc(void* context) {
     PQUEUED_DECODE_UNIT qdu;
@@ -159,9 +176,7 @@ static void DecoderThreadProc(void* context) {
             return;
         }
 
-        int ret = VideoCallbacks.submitDecodeUnit(&qdu->decodeUnit);
-
-        completeQueuedDecodeUnit(qdu, ret);
+        submitFrame(qdu);
     }
 }
 

@@ -1,16 +1,14 @@
 #define _GNU_SOURCE
 
-#include "PlatformThreads.h"
 #include "Platform.h"
+#include "PlatformThreads.h"
+#include "PlatformSockets.h"
 
 #include <enet/enet.h>
 
 // The maximum amount of time before observing an interrupt
 // in PltSleepMsInterruptible().
 #define INTERRUPT_PERIOD_MS 50
-
-int initializePlatformSockets(void);
-void cleanupPlatformSockets(void);
 
 struct thread_context {
     ThreadEntry entry;
@@ -386,10 +384,14 @@ int initializePlatform(void) {
         return err;
     }
 
+    enterLowLatencyMode();
+
 	return 0;
 }
 
 void cleanupPlatform(void) {
+    exitLowLatencyMode();
+
     cleanupPlatformSockets();
     
     enet_deinitialize();

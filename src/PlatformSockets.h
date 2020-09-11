@@ -6,12 +6,15 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#include <wlanapi.h>
+#include <timeapi.h>
 #define SetLastSocketError(x) WSASetLastError(x)
 #define LastSocketError() WSAGetLastError()
 
 #define SHUT_RDWR SD_BOTH
 #define EWOULDBLOCK WSAEWOULDBLOCK
 #define EAGAIN WSAEWOULDBLOCK
+#define EINPROGRESS WSAEINPROGRESS
 #define EINTR WSAEINTR
 #define ETIMEDOUT WSAETIMEDOUT
 
@@ -29,6 +32,7 @@ typedef int SOCKADDR_LEN;
 #include <netdb.h>
 #include <errno.h>
 #include <signal.h>
+#include <poll.h>
 
 #define ioctlsocket ioctl
 #define LastSocketError() errno
@@ -47,7 +51,7 @@ typedef socklen_t SOCKADDR_LEN;
 #define URLSAFESTRING_LEN (INET6_ADDRSTRLEN+2)
 void addrToUrlSafeString(struct sockaddr_storage* addr, char* string);
 
-int resolveHostName(const char* host, int family, int tcpTestPort, struct sockaddr_storage* addr, SOCKADDR_LEN* addrLen);
+SOCKET createSocket(int addressFamily, int socketType, int protocol, int nonBlocking);
 SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, unsigned short port, int timeoutSec);
 int sendMtuSafe(SOCKET s, char* buffer, int size);
 SOCKET bindUdpSocket(int addrfamily, int bufferSize);
@@ -59,6 +63,14 @@ int setNonFatalRecvTimeoutMs(SOCKET s, int timeoutMs);
 void setRecvTimeout(SOCKET s, int timeoutSec);
 void closeSocket(SOCKET s);
 int isPrivateNetworkAddress(struct sockaddr_storage* address);
+int pollSockets(struct pollfd* pollFds, int pollFdsCount, int timeoutMs);
+
+#define TCP_PORT_MASK 0xFFFF
+#define TCP_PORT_FLAG_ALWAYS_TEST 0x10000
+int resolveHostName(const char* host, int family, int tcpTestPort, struct sockaddr_storage* addr, SOCKADDR_LEN* addrLen);
+
+void enterLowLatencyMode(void);
+void exitLowLatencyMode(void);
 
 int initializePlatformSockets(void);
 void cleanupPlatformSockets(void);

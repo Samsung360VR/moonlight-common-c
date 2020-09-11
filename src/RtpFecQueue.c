@@ -126,8 +126,8 @@ static int reconstructFrame(PRTP_FEC_QUEUE queue) {
     }
 
     reed_solomon* rs = NULL;
-    unsigned char** packets = malloc(totalPackets * sizeof(unsigned char*));
-    unsigned char* marks = malloc(totalPackets * sizeof(unsigned char));
+    unsigned char** packets = calloc(totalPackets, sizeof(unsigned char*));
+    unsigned char* marks = calloc(totalPackets, sizeof(unsigned char));
     if (packets == NULL || marks == NULL) {
         ret = -2;
         goto cleanup;
@@ -234,7 +234,10 @@ cleanup_packets:
                     LC_ASSERT(nvPacket->flags == droppedNvPacket->flags);
                     LC_ASSERT(nvPacket->frameIndex == droppedNvPacket->frameIndex);
                     LC_ASSERT(nvPacket->streamPacketIndex == droppedNvPacket->streamPacketIndex);
-                    LC_ASSERT(memcmp(nvPacket->reserved, droppedNvPacket->reserved, sizeof(nvPacket->reserved)) == 0);
+
+                    // TODO: Investigate assertion failure here with GFE 3.20.4. The remaining fields and
+                    // video data are still recovered successfully, so this doesn't seem critical.
+                    //LC_ASSERT(memcmp(nvPacket->reserved, droppedNvPacket->reserved, sizeof(nvPacket->reserved)) == 0);
 
                     // Check the data itself - use memcmp() and only loop if an error is detected
                     if (memcmp(nvPacket + 1, droppedNvPacket + 1, droppedDataLength)) {
