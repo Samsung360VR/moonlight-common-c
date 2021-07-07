@@ -1,7 +1,5 @@
 #include "Limelight-internal.h"
 
-#include <openssl/rand.h>
-
 #define STUN_RECV_TIMEOUT_SEC 3
 
 #define STUN_MESSAGE_BINDING_REQUEST 0x0001
@@ -85,7 +83,7 @@ int LiFindExternalAddressIP4(const char* stunServer, unsigned short stunPort, un
     reqMsg.messageType = htons(STUN_MESSAGE_BINDING_REQUEST);
     reqMsg.messageLength = 0;
     reqMsg.magicCookie = htonl(STUN_MESSAGE_COOKIE);
-    RAND_bytes(reqMsg.transactionId, sizeof(reqMsg.transactionId));
+    PltGenerateRandomData(reqMsg.transactionId, sizeof(reqMsg.transactionId));
 
     bytesRead = SOCKET_ERROR;
     for (i = 0; i < STUN_RECV_TIMEOUT_SEC * 1000 / UDP_RECV_POLL_TIMEOUT_MS && bytesRead <= 0; i++) {
@@ -95,7 +93,7 @@ int LiFindExternalAddressIP4(const char* stunServer, unsigned short stunPort, un
 
             // Send a request to each resolved address but stop if we get a response
             for (current = stunAddrs; current != NULL && bytesRead <= 0; current = current->ai_next) {
-                err = (int)sendto(sock, (char *)&reqMsg, sizeof(reqMsg), 0, current->ai_addr, current->ai_addrlen);
+                err = (int)sendto(sock, (char *)&reqMsg, sizeof(reqMsg), 0, current->ai_addr, (SOCKADDR_LEN)current->ai_addrlen);
                 if (err == SOCKET_ERROR) {
                     err = LastSocketFail();
                     Limelog("Failed to send STUN binding request: %d\n", err);
@@ -104,12 +102,12 @@ int LiFindExternalAddressIP4(const char* stunServer, unsigned short stunPort, un
 
                 // Wait UDP_RECV_POLL_TIMEOUT_MS before moving on to the next server to
                 // avoid having to spam the other STUN servers if we find a working one.
-                bytesRead = recvUdpSocket(sock, resp.buf, sizeof(resp.buf), 1);
+                bytesRead = recvUdpSocket(sock, resp.buf, sizeof(resp.buf), true);
             }
         }
         else {
             // This waits in UDP_RECV_POLL_TIMEOUT_MS increments
-            bytesRead = recvUdpSocket(sock, resp.buf, sizeof(resp.buf), 1);
+            bytesRead = recvUdpSocket(sock, resp.buf, sizeof(resp.buf), true);
         }
     }
 
@@ -123,7 +121,7 @@ int LiFindExternalAddressIP4(const char* stunServer, unsigned short stunPort, un
         Limelog("Failed to read STUN binding response: %d\n", err);
         goto Exit;
     }
-    else if (bytesRead < sizeof(resp.hdr)) {
+    else if (bytesRead < (int)sizeof(resp.hdr)) {
         Limelog("STUN message truncated: %d\n", bytesRead);
         err = -3;
         goto Exit;
@@ -146,8 +144,8 @@ int LiFindExternalAddressIP4(const char* stunServer, unsigned short stunPort, un
 
     attribute = (PSTUN_ATTRIBUTE_HEADER)(&resp.hdr + 1);
     bytesRead -= sizeof(resp.hdr);
-    while (bytesRead > sizeof(*attribute)) {
-        if (bytesRead < sizeof(*attribute) + htons(attribute->length)) {
+    while (bytesRead > (int)sizeof(*attribute)) {
+        if (bytesRead < (int)(sizeof(*attribute) + htons(attribute->length))) {
             Limelog("STUN attribute out of bounds: %d\n", htons(attribute->length));
             err = -5;
             goto Exit;

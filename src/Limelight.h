@@ -5,6 +5,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,6 +28,11 @@ extern "C" {
 // Values for the 'colorRange' field below
 #define COLOR_RANGE_LIMITED  0
 #define COLOR_RANGE_FULL     1
+
+// Values for 'encryptionFlags' field below
+#define ENCFLG_NONE  0x00000000
+#define ENCFLG_AUDIO 0x00000001
+#define ENCFLG_ALL   0xFFFFFFFF
 
 typedef struct _STREAM_CONFIGURATION {
     // Dimensions in pixels of the desired video stream
@@ -57,7 +63,7 @@ typedef struct _STREAM_CONFIGURATION {
     
     // Specifies that the client can accept an H.265 video stream
     // if the server is able to provide one.
-    int supportsHevc;
+    bool supportsHevc;
 
     // Specifies that the client is requesting an HDR H.265 video stream.
     //
@@ -65,7 +71,7 @@ typedef struct _STREAM_CONFIGURATION {
     // 1) The client decoder supports HEVC Main10 profile (supportsHevc must be set too)
     // 2) The server has support for HDR as indicated by ServerCodecModeSupport in /serverinfo
     // 3) The app supports HDR as indicated by IsHdrSupported in /applist
-    int enableHdr;
+    bool enableHdr;
 
     // Specifies the percentage that the specified bitrate will be adjusted
     // when an HEVC stream will be delivered. This allows clients to opt to
@@ -85,6 +91,14 @@ typedef struct _STREAM_CONFIGURATION {
     // If specified, sets the encoder color range to the provided COLOR_RANGE_*
     // option (listed above). If not set, the encoder will default to Limited.
     int colorRange;
+
+    // Specifies the data streams where encryption may be enabled if supported
+    // by the host PC. Ideally, you would pass ENCFLG_ALL to encrypt everything
+    // that we support encrypting. However, lower performance hardware may not
+    // be able to support encrypting heavy stuff like video or audio data, so
+    // that encryption may be disabled here. Remote input encryption is always
+    // enabled.
+    int encryptionFlags;
 
     // AES encryption data for the remote input stream. This must be
     // the same as what was passed as rikey and rikeyid
@@ -135,10 +149,16 @@ typedef struct _DECODE_UNIT {
     // Frame type
     int frameType;
 
-    // Receive time of first buffer. This value uses an implementation-defined epoch.
-    // To compute actual latency values, use LiGetMillis() to get a timestamp that
-    // shares the same epoch as this value.
-    unsigned long long receiveTimeMs;
+    // Receive time of first buffer. This value uses an implementation-defined epoch,
+    // but the same epoch as enqueueTimeMs and LiGetMillis().
+    uint64_t receiveTimeMs;
+
+    // Time the frame was fully assembled and queued for the video decoder to process.
+    // This is also approximately the same time as the final packet was received, so
+    // enqueueTimeMs - receiveTimeMs is the time taken to receive the frame. At the
+    // time the decode unit is passed to submitDecodeUnit(), the total queue delay
+    // can be calculated by LiGetMillis() - enqueueTimeMs.
+    uint64_t enqueueTimeMs;
 
     // Presentation time in milliseconds with the epoch at the first captured frame.
     // This can be used to aid frame pacing or to drop old frames that were queued too
@@ -220,6 +240,12 @@ typedef struct _DECODE_UNIT {
 // samplesPerFrame field in OPUS_MULTISTREAM_CONFIGURATION to calculate the correct decoded
 // buffer size rather than just assuming it will always be 240.
 #define CAPABILITY_SUPPORTS_ARBITRARY_AUDIO_DURATION 0x10
+
+// This flag opts the renderer into a pull-based model rather than the default push-based
+// callback model. The renderer must invoke the new functions (LiWaitForNextVideoFrame(),
+// LiCompleteVideoFrame(), and similar) to receive A/V data. Setting this capability while
+// also providing a sample callback is not allowed.
+#define CAPABILITY_PULL_RENDERER 0x20
 
 // If set in the video renderer capabilities field, this macro specifies that the renderer
 // supports slicing to increase decoding performance. The parameter specifies the desired
@@ -318,10 +344,10 @@ void LiInitializeAudioCallbacks(PAUDIO_RENDERER_CALLBACKS arCallbacks);
 #define STAGE_NONE 0
 #define STAGE_PLATFORM_INIT 1
 #define STAGE_NAME_RESOLUTION 2
-#define STAGE_RTSP_HANDSHAKE 3
-#define STAGE_CONTROL_STREAM_INIT 4
-#define STAGE_VIDEO_STREAM_INIT 5
-#define STAGE_AUDIO_STREAM_INIT 6
+#define STAGE_AUDIO_STREAM_INIT 3
+#define STAGE_RTSP_HANDSHAKE 4
+#define STAGE_CONTROL_STREAM_INIT 5
+#define STAGE_VIDEO_STREAM_INIT 6
 #define STAGE_INPUT_STREAM_INIT 7
 #define STAGE_CONTROL_STREAM_START 8
 #define STAGE_VIDEO_STREAM_START 9
@@ -368,6 +394,16 @@ typedef void(*ConnListenerConnectionTerminated)(int errorCode);
 // an extremely unstable connection or a bitrate that is far too high.
 #define ML_ERROR_NO_VIDEO_FRAME -101
 
+// This error is passed to ConnListenerConnectionTerminated() if the stream ends
+// very soon after starting due to a graceful termination from the host. Usually
+// this seems to happen if DRM protected content is on-screen (pre-GFE 3.22), or
+// another issue that prevents the encoder from being able to capture video successfully.
+#define ML_ERROR_UNEXPECTED_EARLY_TERMINATION -102
+
+// This error is passed to ConnListenerConnectionTerminated() if the stream ends
+// due to a protected content error from the host. This value is supported on GFE 3.22+.
+#define ML_ERROR_PROTECTED_CONTENT -103
+
 // This callback is invoked to log debug message
 typedef void(*ConnListenerLogMessage)(const char* format, ...);
 
@@ -409,6 +445,9 @@ typedef struct _SERVER_INFORMATION {
     
     // Text inside 'GfeVersion' tag in /serverinfo (if present)
     const char* serverInfoGfeVersion;
+
+    // Text inside 'sessionUrl0' tag in /resume and /launch (if present)
+    const char* rtspSessionUrl;
 } SERVER_INFORMATION, *PSERVER_INFORMATION;
 
 // Use this function to zero the server information when allocated on the stack or heap
@@ -435,6 +474,12 @@ void LiInterruptConnection(void);
 // Use to get a user-visible string to display initialization progress
 // from the integer passed to the ConnListenerStageXXX callbacks
 const char* LiGetStageName(int stage);
+
+// This function returns an estimate of the current RTT to the host PC obtained via ENet
+// protocol statistics. This function will fail if the current GFE version does not use
+// ENet for the control stream (very old versions), or if the ENet peer is not connected.
+// This function may only be called between LiStartConnection() and LiStopConnection().
+bool LiGetEstimatedRttInfo(uint32_t* estimatedRtt, uint32_t* estimatedRttVariance);
 
 // This function queues a relative mouse move event to be sent to the remote server.
 int LiSendMouseMoveEvent(short deltaX, short deltaY);
@@ -574,6 +619,11 @@ int LiGetProtocolFromPortFlagIndex(int portFlagIndex);
 // Returns the port number for the specified port index
 unsigned short LiGetPortFromPortFlagIndex(int portFlagIndex);
 
+// Populates the output buffer with a stringified list of the port flags set in the input argument.
+// The second and subsequent entries will be prepended by 'separator' (if provided).
+// If the output buffer is too small, the output will be truncated to fit the provided buffer.
+void LiStringifyPortFlags(unsigned int portFlags, const char* separator, char* outputBuffer, int outputBufferLength);
+
 // This function may be used to test if the local network is blocking Moonlight's ports. It requires
 // a test server running on an Internet-reachable host. To perform a test, pass in the DNS hostname
 // of the test server, a reference TCP port to ensure the test host is reachable at all (something
@@ -587,6 +637,18 @@ unsigned short LiGetPortFromPortFlagIndex(int portFlagIndex);
 // The test server is available at https://github.com/cgutman/gfe-loopback
 #define ML_TEST_RESULT_INCONCLUSIVE 0xFFFFFFFF
 unsigned int LiTestClientConnectivity(const char* testServer, unsigned short referencePort, unsigned int testPortFlags);
+
+// This family of functions can be used for pull-based video renderers that opt to manage a decoding/rendering
+// thread themselves. After successfully calling the WaitFor/Poll variants that dequeue the video frame, you
+// must call LiCompleteVideoFrame() to notify that processing is completed. The same DR_* status values
+// from drSubmitDecodeUnit() must be passed to LiCompleteVideoFrame() as the drStatus argument.
+//
+// In order to safely use these functions, you must set CAPABILITY_PULL_RENDERER on the video decoder.
+typedef void* VIDEO_FRAME_HANDLE;
+bool LiWaitForNextVideoFrame(VIDEO_FRAME_HANDLE* frameHandle, PDECODE_UNIT* decodeUnit);
+bool LiPollNextVideoFrame(VIDEO_FRAME_HANDLE* frameHandle, PDECODE_UNIT* decodeUnit);
+bool LiPeekNextVideoFrame(PDECODE_UNIT* decodeUnit);
+void LiCompleteVideoFrame(VIDEO_FRAME_HANDLE handle, int drStatus);
 
 #ifdef __cplusplus
 }

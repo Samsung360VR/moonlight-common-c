@@ -1,11 +1,15 @@
 #pragma once
 
-#include "Limelight.h"
 #include "Platform.h"
+#include "Limelight.h"
 #include "PlatformSockets.h"
 #include "PlatformThreads.h"
+#include "PlatformCrypto.h"
 #include "Video.h"
-#include "RtpFecQueue.h"
+#include "Input.h"
+#include "RtpAudioQueue.h"
+#include "RtpVideoQueue.h"
+#include "ByteBuffer.h"
 
 #include <enet/enet.h>
 
@@ -19,13 +23,19 @@ extern CONNECTION_LISTENER_CALLBACKS ListenerCallbacks;
 extern DECODER_RENDERER_CALLBACKS VideoCallbacks;
 extern AUDIO_RENDERER_CALLBACKS AudioCallbacks;
 extern int NegotiatedVideoFormat;
-extern volatile int ConnectionInterrupted;
-extern int HighQualitySurroundSupported;
-extern int HighQualitySurroundEnabled;
+extern volatile bool ConnectionInterrupted;
+extern bool HighQualitySurroundSupported;
+extern bool HighQualitySurroundEnabled;
 extern OPUS_MULTISTREAM_CONFIGURATION NormalQualityOpusConfig;
 extern OPUS_MULTISTREAM_CONFIGURATION HighQualityOpusConfig;
 extern int OriginalVideoBitrate;
 extern int AudioPacketDuration;
+extern bool AudioEncryptionEnabled;
+
+extern uint16_t RtspPortNumber;
+extern uint16_t ControlPortNumber;
+extern uint16_t AudioPortNumber;
+extern uint16_t VideoPortNumber;
 
 #ifndef UINT24_MAX
 #define UINT24_MAX 0xFFFFFF
@@ -38,6 +48,11 @@ extern int AudioPacketDuration;
 #define isBefore16(x, y) (U16((x) - (y)) > (UINT16_MAX/2))
 #define isBefore24(x, y) (U24((x) - (y)) > (UINT24_MAX/2))
 #define isBefore32(x, y) (U32((x) - (y)) > (UINT32_MAX/2))
+
+#define APP_VERSION_AT_LEAST(a, b, c)                                                       \
+    ((AppVersionQuad[0] > (a)) ||                                                           \
+     (AppVersionQuad[0] == (a) && AppVersionQuad[1] > (b)) ||                               \
+     (AppVersionQuad[0] == (a) && AppVersionQuad[1] == (b) && AppVersionQuad[2] >= (c)))
 
 #define UDP_RECV_POLL_TIMEOUT_MS 100
 
@@ -53,12 +68,14 @@ extern int AudioPacketDuration;
 #define MAGIC_BYTE_FROM_AUDIO_CONFIG(x) ((x) & 0xFF)
 
 int serviceEnetHost(ENetHost* client, ENetEvent* event, enet_uint32 timeoutMs);
+int gracefullyDisconnectEnetPeer(ENetHost* host, ENetPeer* peer, enet_uint32 lingerTimeoutMs);
 int extractVersionQuadFromString(const char* string, int* quad);
-int isReferenceFrameInvalidationEnabled(void);
+bool isReferenceFrameInvalidationEnabled(void);
 void* extendBuffer(void* ptr, size_t newSize);
 
 void fixupMissingCallbacks(PDECODER_RENDERER_CALLBACKS* drCallbacks, PAUDIO_RENDERER_CALLBACKS* arCallbacks,
     PCONNECTION_LISTENER_CALLBACKS* clCallbacks);
+void setRecorderCallbacks(PDECODER_RENDERER_CALLBACKS drCallbacks, PAUDIO_RENDERER_CALLBACKS arCallbacks);
 
 char* getSdpPayloadForStreamConfig(int rtspClientVersion, int* length);
 
@@ -77,17 +94,18 @@ int performRtspHandshake(void);
 
 void initializeVideoDepacketizer(int pktSize);
 void destroyVideoDepacketizer(void);
-void queueRtpPacket(PRTPFEC_QUEUE_ENTRY queueEntry);
+void queueRtpPacket(PRTPV_QUEUE_ENTRY queueEntry);
 void stopVideoDepacketizer(void);
 void requestDecoderRefresh(void);
 
 void initializeVideoStream(void);
 void destroyVideoStream(void);
+void notifyKeyFrameReceived(void);
 int startVideoStream(void* rendererContext, int drFlags);
-void submitFrame(PQUEUED_DECODE_UNIT qdu);
 void stopVideoStream(void);
 
-void initializeAudioStream(void);
+int initializeAudioStream(void);
+int notifyAudioPortNegotiationComplete(void);
 void destroyAudioStream(void);
 int startAudioStream(void* audioContext, int arFlags);
 void stopAudioStream(void);

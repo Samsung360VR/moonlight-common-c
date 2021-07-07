@@ -1,9 +1,8 @@
 #include "Limelight-internal.h"
-#include "Platform.h"
 
 static int stage = STAGE_NONE;
 static ConnListenerConnectionTerminated originalTerminationCallback;
-static int alreadyTerminated;
+static bool alreadyTerminated;
 static PLT_THREAD terminationCallbackThread;
 static int terminationCallbackErrorCode;
 
@@ -17,23 +16,28 @@ CONNECTION_LISTENER_CALLBACKS ListenerCallbacks;
 DECODER_RENDERER_CALLBACKS VideoCallbacks;
 AUDIO_RENDERER_CALLBACKS AudioCallbacks;
 int NegotiatedVideoFormat;
-volatile int ConnectionInterrupted;
-int HighQualitySurroundSupported;
-int HighQualitySurroundEnabled;
+volatile bool ConnectionInterrupted;
+bool HighQualitySurroundSupported;
+bool HighQualitySurroundEnabled;
 OPUS_MULTISTREAM_CONFIGURATION NormalQualityOpusConfig;
 OPUS_MULTISTREAM_CONFIGURATION HighQualityOpusConfig;
 int OriginalVideoBitrate;
 int AudioPacketDuration;
+bool AudioEncryptionEnabled;
+uint16_t RtspPortNumber;
+uint16_t ControlPortNumber;
+uint16_t AudioPortNumber;
+uint16_t VideoPortNumber;
 
 // Connection stages
 static const char* stageNames[STAGE_MAX] = {
     "none",
     "platform initialization",
     "name resolution",
+    "audio stream initialization",
     "RTSP handshake",
     "control stream initialization",
     "video stream initialization",
-    "audio stream initialization",
     "input stream initialization",
     "control stream establishment",
     "video stream establishment",
@@ -50,13 +54,13 @@ const char* LiGetStageName(int stage) {
 // so it is not safe to start another connection before LiStartConnection() returns.
 void LiInterruptConnection(void) {
     // Signal anyone waiting on the global interrupted flag
-    ConnectionInterrupted = 1;
+    ConnectionInterrupted = true;
 }
 
 // Stop the connection by undoing the step at the current stage and those before it
 void LiStopConnection(void) {
     // Disable termination callbacks now
-    alreadyTerminated = 1;
+    alreadyTerminated = true;
 
     // Set the interrupted flag
     LiInterruptConnection();
@@ -91,12 +95,6 @@ void LiStopConnection(void) {
         stage--;
         Limelog("done\n");
     }
-    if (stage == STAGE_AUDIO_STREAM_INIT) {
-        Limelog("Cleaning up audio stream...");
-        destroyAudioStream();
-        stage--;
-        Limelog("done\n");
-    }
     if (stage == STAGE_VIDEO_STREAM_INIT) {
         Limelog("Cleaning up video stream...");
         destroyVideoStream();
@@ -112,6 +110,12 @@ void LiStopConnection(void) {
     if (stage == STAGE_RTSP_HANDSHAKE) {
         // Nothing to do
         stage--;
+    }
+    if (stage == STAGE_AUDIO_STREAM_INIT) {
+        Limelog("Cleaning up audio stream...");
+        destroyAudioStream();
+        stage--;
+        Limelog("done\n");
     }
     if (stage == STAGE_NAME_RESOLUTION) {
         // Nothing to do
@@ -153,7 +157,7 @@ static void ClInternalConnectionTerminated(int errorCode)
     }
 
     terminationCallbackErrorCode = errorCode;
-    alreadyTerminated = 1;
+    alreadyTerminated = true;
 
     // Invoke the termination callback on a separate thread
     err = PltCreateThread("AsyncTerm", terminationCallbackThreadFunc, NULL, &terminationCallbackThread);
@@ -167,16 +171,59 @@ static void ClInternalConnectionTerminated(int errorCode)
     PltCloseThread(&terminationCallbackThread);
 }
 
+static bool parseRtspPortNumberFromUrl(const char* rtspSessionUrl, uint16_t* port)
+{
+    // If the session URL is not present, we will just use the well known port
+    if (rtspSessionUrl == NULL) {
+        return false;
+    }
+
+    // Pick the last colon in the string to match the port number
+    char* portNumberStart = strrchr(rtspSessionUrl, ':');
+    if (portNumberStart == NULL) {
+        return false;
+    }
+
+    // Skip the colon
+    portNumberStart++;
+
+    // Validate the port number
+    long int rawPort = strtol(portNumberStart, NULL, 10);
+    if (rawPort <= 0 || rawPort > 65535) {
+        return false;
+    }
+
+    *port = (uint16_t)rawPort;
+    return true;
+}
+
 // Starts the connection to the streaming machine
 int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION streamConfig, PCONNECTION_LISTENER_CALLBACKS clCallbacks,
     PDECODER_RENDERER_CALLBACKS drCallbacks, PAUDIO_RENDERER_CALLBACKS arCallbacks, void* renderContext, int drFlags,
     void* audioContext, int arFlags) {
     int err;
 
+    if ((drCallbacks->capabilities & CAPABILITY_PULL_RENDERER) && drCallbacks->submitDecodeUnit) {
+        Limelog("CAPABILITY_PULL_RENDERER cannot be set with a submitDecodeUnit callback\n");
+        err = -1;
+        goto Cleanup;
+    }
+
+    if ((drCallbacks->capabilities & CAPABILITY_PULL_RENDERER) && (drCallbacks->capabilities & CAPABILITY_DIRECT_SUBMIT)) {
+        Limelog("CAPABILITY_PULL_RENDERER and CAPABILITY_DIRECT_SUBMIT cannot be set together\n");
+        err = -1;
+        goto Cleanup;
+    }
+
     // Replace missing callbacks with placeholders
     fixupMissingCallbacks(&drCallbacks, &arCallbacks, &clCallbacks);
     memcpy(&VideoCallbacks, drCallbacks, sizeof(VideoCallbacks));
     memcpy(&AudioCallbacks, arCallbacks, sizeof(AudioCallbacks));
+
+#ifdef LC_DEBUG_RECORD_MODE
+    // Install the pass-through recorder callbacks
+    setRecorderCallbacks(&VideoCallbacks, &AudioCallbacks);
+#endif
 
     // Hook the termination callback so we can avoid issuing a termination callback
     // after LiStopConnection() is called.
@@ -190,6 +237,25 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
     memcpy(&StreamConfig, streamConfig, sizeof(StreamConfig));
     OriginalVideoBitrate = streamConfig->bitrate;
     RemoteAddrString = strdup(serverInfo->address);
+
+    // The values in RTSP SETUP will be used to populate these.
+    VideoPortNumber = 0;
+    ControlPortNumber = 0;
+    AudioPortNumber = 0;
+
+    // Parse RTSP port number from RTSP session URL
+    if (!parseRtspPortNumberFromUrl(serverInfo->rtspSessionUrl, &RtspPortNumber)) {
+        // Use the well known port if parsing fails
+        RtspPortNumber = 48010;
+
+        Limelog("RTSP port: %u (RTSP URL parsing failed)\n", RtspPortNumber);
+    }
+    else {
+        Limelog("RTSP port: %u\n", RtspPortNumber);
+    }
+
+    alreadyTerminated = false;
+    ConnectionInterrupted = false;
     
     // Validate the audio configuration
     if (MAGIC_BYTE_FROM_AUDIO_CONFIG(StreamConfig.audioConfiguration) != 0xCA ||
@@ -226,6 +292,16 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
     else if (StreamConfig.width > 8192 || StreamConfig.height > 8192) {
         Limelog("WARNING: Streaming at resolutions above 8K will likely fail! Trying anyway!\n");
     }
+
+    // Reference frame invalidation doesn't seem to work with resolutions much
+    // higher than 1440p. I haven't figured out a pattern to indicate which
+    // resolutions will work and which won't, but we can at least exclude
+    // 4K from RFI to avoid significant persistent artifacts after frame loss.
+    if (StreamConfig.width == 3840 && StreamConfig.height == 2160 &&
+            (VideoCallbacks.capabilities & CAPABILITY_REFERENCE_FRAME_INVALIDATION_AVC)) {
+        Limelog("Disabling reference frame invalidation for 4K streaming\n");
+        VideoCallbacks.capabilities &= ~CAPABILITY_REFERENCE_FRAME_INVALIDATION_AVC;
+    }
     
     // Extract the appversion from the supplied string
     if (extractVersionQuadFromString(serverInfo->serverInfoAppVersion,
@@ -234,9 +310,6 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
         err = -1;
         goto Cleanup;
     }
-
-    alreadyTerminated = 0;
-    ConnectionInterrupted = 0;
 
     Limelog("Initializing platform...");
     ListenerCallbacks.stageStarting(STAGE_PLATFORM_INIT);
@@ -289,6 +362,19 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
         }
     }
 
+    Limelog("Initializing audio stream...");
+    ListenerCallbacks.stageStarting(STAGE_AUDIO_STREAM_INIT);
+    err = initializeAudioStream();
+    if (err != 0) {
+        Limelog("failed: %d\n", err);
+        ListenerCallbacks.stageFailed(STAGE_AUDIO_STREAM_INIT, err);
+        goto Cleanup;
+    }
+    stage++;
+    LC_ASSERT(stage == STAGE_AUDIO_STREAM_INIT);
+    ListenerCallbacks.stageComplete(STAGE_AUDIO_STREAM_INIT);
+    Limelog("done\n");
+
     Limelog("Starting RTSP handshake...");
     ListenerCallbacks.stageStarting(STAGE_RTSP_HANDSHAKE);
     err = performRtspHandshake();
@@ -321,14 +407,6 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
     stage++;
     LC_ASSERT(stage == STAGE_VIDEO_STREAM_INIT);
     ListenerCallbacks.stageComplete(STAGE_VIDEO_STREAM_INIT);
-    Limelog("done\n");
-
-    Limelog("Initializing audio stream...");
-    ListenerCallbacks.stageStarting(STAGE_AUDIO_STREAM_INIT);
-    initializeAudioStream();
-    stage++;
-    LC_ASSERT(stage == STAGE_AUDIO_STREAM_INIT);
-    ListenerCallbacks.stageComplete(STAGE_AUDIO_STREAM_INIT);
     Limelog("done\n");
 
     Limelog("Initializing input stream...");

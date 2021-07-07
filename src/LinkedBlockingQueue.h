@@ -16,13 +16,14 @@ typedef struct _LINKED_BLOCKING_QUEUE_ENTRY {
 
 typedef struct _LINKED_BLOCKING_QUEUE {
     PLT_MUTEX mutex;
-    PLT_EVENT containsDataEvent;
-    int sizeBound;
-    int currentSize;
-    int shutdown;
-    int lifetimeSize;
+    PLT_COND cond;
     PLINKED_BLOCKING_QUEUE_ENTRY head;
     PLINKED_BLOCKING_QUEUE_ENTRY tail;
+    int sizeBound;
+    int currentSize;
+    int lifetimeSize;
+    bool shutdown;
+    bool draining;
 } LINKED_BLOCKING_QUEUE, *PLINKED_BLOCKING_QUEUE;
 
 int LbqInitializeLinkedBlockingQueue(PLINKED_BLOCKING_QUEUE queueHead, int sizeBound);
@@ -33,4 +34,5 @@ int LbqPeekQueueElement(PLINKED_BLOCKING_QUEUE queueHead, void** data);
 PLINKED_BLOCKING_QUEUE_ENTRY LbqDestroyLinkedBlockingQueue(PLINKED_BLOCKING_QUEUE queueHead);
 PLINKED_BLOCKING_QUEUE_ENTRY LbqFlushQueueItems(PLINKED_BLOCKING_QUEUE queueHead);
 void LbqSignalQueueShutdown(PLINKED_BLOCKING_QUEUE queueHead);
+void LbqSignalQueueDrain(PLINKED_BLOCKING_QUEUE queueHead);
 int LbqGetItemCount(PLINKED_BLOCKING_QUEUE queueHead);

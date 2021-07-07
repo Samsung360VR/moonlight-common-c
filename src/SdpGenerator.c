@@ -133,26 +133,65 @@ static int addGen4Options(PSDP_OPTION* head, char* addrStr) {
     char payloadStr[92];
     int err = 0;
 
-    sprintf(payloadStr, "rtsp://%s:48010", addrStr);
+    LC_ASSERT(RtspPortNumber != 0);
+    sprintf(payloadStr, "rtsp://%s:%u", addrStr, RtspPortNumber);
     err |= addAttributeString(head, "x-nv-general.serverAddress", payloadStr);
 
     return err;
 }
 
+#define NVFF_BASE             0x07
+#define NVFF_AUDIO_ENCRYPTION 0x20
+#define NVFF_RI_ENCRYPTION    0x80
+
 static int addGen5Options(PSDP_OPTION* head) {
     int err = 0;
+    char payloadStr[32];
 
-    // We want to use the new ENet connections for control and input
-    err |= addAttributeString(head, "x-nv-general.useReliableUdp", "1");
-    err |= addAttributeString(head, "x-nv-ri.useControlChannel", "1");
+    // This must be initialized to false already
+    LC_ASSERT(!AudioEncryptionEnabled);
+
+    if (APP_VERSION_AT_LEAST(7, 1, 431)) {
+        unsigned int featureFlags;
+
+        // RI encryption is always enabled
+        featureFlags = NVFF_BASE | NVFF_RI_ENCRYPTION;
+
+        // Enable audio encryption if the client opted in
+        if (StreamConfig.encryptionFlags & ENCFLG_AUDIO) {
+            featureFlags |= NVFF_AUDIO_ENCRYPTION;
+            AudioEncryptionEnabled = true;
+        }
+
+        sprintf(payloadStr, "%u", featureFlags);
+        err |= addAttributeString(head, "x-nv-general.featureFlags", payloadStr);
+
+        // Ask for the encrypted control protocol to ensure remote input will be encrypted.
+        // This used to be done via separate RI encryption, but now it is all or nothing.
+        err |= addAttributeString(head, "x-nv-general.useReliableUdp", "13");
+
+        // Require at least 2 FEC packets for small frames. If a frame has fewer data shards
+        // than would generate 2 FEC shards, it will increase the FEC percentage for that frame
+        // above the set value (even going as high as 200% FEC to generate 2 FEC shards from a
+        // 1 data shard frame).
+        err |= addAttributeString(head, "x-nv-vqos[0].fec.minRequiredFecPackets", "2");
+    }
+    else {
+        // We want to use the new ENet connections for control and input
+        err |= addAttributeString(head, "x-nv-general.useReliableUdp", "1");
+        err |= addAttributeString(head, "x-nv-ri.useControlChannel", "1");
+
+        // When streaming 4K, lower FEC levels to reduce stream overhead
+        if (StreamConfig.width >= 3840 && StreamConfig.height >= 2160) {
+            err |= addAttributeString(head, "x-nv-vqos[0].fec.repairPercent", "5");
+        }
+        else {
+            err |= addAttributeString(head, "x-nv-vqos[0].fec.repairPercent", "20");
+        }
+    }
     
     // Disable dynamic resolution switching
     err |= addAttributeString(head, "x-nv-vqos[0].drc.enable", "0");
-
-    // When streaming 4K, lower FEC levels to reduce stream overhead
-    if (StreamConfig.width >= 3840 && StreamConfig.height >= 2160) {
-        err |= addAttributeString(head, "x-nv-vqos[0].fec.repairPercent", "5");
-    }
 
     // Recovery mode can cause the FEC percentage to change mid-frame, which
     // breaks many assumptions in RTP FEC queue.
@@ -246,9 +285,23 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
     
     err |= addAttributeString(&optionHead, "x-nv-vqos[0].videoQualityScoreUpdateTime", "5000");
 
-    // Enable DSCP marking to hopefully increase QoS priority
-    err |= addAttributeString(&optionHead, "x-nv-vqos[0].qosTrafficType", "5");
-    err |= addAttributeString(&optionHead, "x-nv-aqos.qosTrafficType", "4");
+    // If the remote host is local (RFC 1918), enable QoS tagging for our traffic. Windows qWave
+    // will disable it if the host is off-link, *however* Windows may get it wrong in cases where
+    // the host is directly connected to the Internet without a NAT. In this case, it may send DSCP
+    // marked traffic off-link and it could lead to black holes due to misconfigured ISP hardware
+    // or CPE. For this reason, we only enable it in cases where it looks like it will work.
+    //
+    // Even though IPv6 hardware should be much less likely to have this issue, we can't tell
+    // if our address is a NAT64 synthesized IPv6 address or true end-to-end IPv6. If it's the
+    // former, it may have the same problem as other IPv4 traffic.
+    if (StreamConfig.streamingRemotely == STREAM_CFG_LOCAL) {
+        err |= addAttributeString(&optionHead, "x-nv-vqos[0].qosTrafficType", "5");
+        err |= addAttributeString(&optionHead, "x-nv-aqos.qosTrafficType", "4");
+    }
+    else {
+        err |= addAttributeString(&optionHead, "x-nv-vqos[0].qosTrafficType", "0");
+        err |= addAttributeString(&optionHead, "x-nv-aqos.qosTrafficType", "0");
+    }
 
     if (AppVersionQuad[0] == 3) {
         err |= addGen3Options(&optionHead, urlSafeAddr);
@@ -351,22 +404,19 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
 
             // Let the audio stream code know that it needs to disable coupled streams when
             // decoding this audio stream.
-            HighQualitySurroundEnabled = 1;
+            HighQualitySurroundEnabled = true;
 
             // Use 5 ms frames since we don't have a slow decoder
             AudioPacketDuration = 5;
         }
         else {
             err |= addAttributeString(&optionHead, "x-nv-audio.surround.AudioQuality", "0");
-            HighQualitySurroundEnabled = 0;
+            HighQualitySurroundEnabled = false;
 
-            if ((AudioCallbacks.capabilities & CAPABILITY_SLOW_OPUS_DECODER) != 0) {
-                // Use 20 ms packets for slow decoders to save CPU time
-                AudioPacketDuration = 20;
-            }
-            else if ((AudioCallbacks.capabilities & CAPABILITY_SUPPORTS_ARBITRARY_AUDIO_DURATION) != 0 &&
-                      OriginalVideoBitrate < LOW_AUDIO_BITRATE_TRESHOLD) {
-                // Use 10 ms packets for slow networks to balance latency and bandwidth usage
+            if ((AudioCallbacks.capabilities & CAPABILITY_SLOW_OPUS_DECODER) ||
+                     ((AudioCallbacks.capabilities & CAPABILITY_SUPPORTS_ARBITRARY_AUDIO_DURATION) != 0 &&
+                       OriginalVideoBitrate < LOW_AUDIO_BITRATE_TRESHOLD)) {
+                // Use 10 ms packets for slow devices and networks to balance latency and bandwidth usage
                 AudioPacketDuration = 10;
             }
             else {
@@ -383,7 +433,7 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
         AudioPacketDuration = 5;
 
         // High quality audio mode not supported on legacy servers
-        HighQualitySurroundEnabled = 0;
+        HighQualitySurroundEnabled = false;
     }
 
     if (AppVersionQuad[0] >= 7) {
@@ -412,10 +462,11 @@ static int fillSdpHeader(char* buffer, int rtspClientVersion, char*urlSafeAddr) 
 
 // Populate the SDP tail with required information
 static int fillSdpTail(char* buffer) {
+    LC_ASSERT(VideoPortNumber != 0);
     return sprintf(buffer,
         "t=0 0\r\n"
         "m=video %d  \r\n",
-        AppVersionQuad[0] < 4 ? 47996 : 47998);
+        AppVersionQuad[0] < 4 ? 47996 : VideoPortNumber);
 }
 
 // Get the SDP attributes for the stream config

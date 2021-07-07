@@ -1,5 +1,4 @@
 #include "Limelight-internal.h"
-#include "RtpFecQueue.h"
 #include "rs.h"
 
 #ifdef LC_DEBUG
@@ -7,26 +6,86 @@
 // and recovered packet checks vs the original input. It
 // is on by default for debug builds.
 #define FEC_VALIDATION_MODE
+#define FEC_VERBOSE
 #endif
 
-void RtpfInitializeQueue(PRTP_FEC_QUEUE queue) {
+void RtpvInitializeQueue(PRTP_VIDEO_QUEUE queue) {
     reed_solomon_init();
     memset(queue, 0, sizeof(*queue));
     
     queue->currentFrameNumber = UINT16_MAX;
+
+    queue->multiFecCapable = APP_VERSION_AT_LEAST(7, 1, 431);
 }
 
-void RtpfCleanupQueue(PRTP_FEC_QUEUE queue) {
-    while (queue->bufferHead != NULL) {
-        PRTPFEC_QUEUE_ENTRY entry = queue->bufferHead;
-        queue->bufferHead = entry->next;
+static void purgeListEntries(PRTPV_QUEUE_LIST list) {
+    while (list->head != NULL) {
+        PRTPV_QUEUE_ENTRY entry = list->head;
+        list->head = entry->next;
         free(entry->packet);
     }
+
+    list->tail = NULL;
+    list->count = 0;
+}
+
+void RtpvCleanupQueue(PRTP_VIDEO_QUEUE queue) {
+    purgeListEntries(&queue->pendingFecBlockList);
+    purgeListEntries(&queue->completedFecBlockList);
+}
+
+static void insertEntryIntoList(PRTPV_QUEUE_LIST list, PRTPV_QUEUE_ENTRY entry) {
+    LC_ASSERT(entry->prev == NULL);
+    LC_ASSERT(entry->next == NULL);
+
+    if (list->head == NULL) {
+        LC_ASSERT(list->count == 0);
+        LC_ASSERT(list->tail == NULL);
+        list->head = list->tail = entry;
+    }
+    else {
+        LC_ASSERT(list->count != 0);
+        PRTPV_QUEUE_ENTRY oldTail = list->tail;
+        entry->prev = oldTail;
+        LC_ASSERT(oldTail->next == NULL);
+        oldTail->next = entry;
+        list->tail = entry;
+    }
+
+    list->count++;
+}
+
+static void removeEntryFromList(PRTPV_QUEUE_LIST list, PRTPV_QUEUE_ENTRY entry) {
+    LC_ASSERT(entry != NULL);
+    LC_ASSERT(list->count != 0);
+    LC_ASSERT(list->head != NULL);
+    LC_ASSERT(list->tail != NULL);
+
+    if (list->head == entry) {
+        list->head = entry->next;
+    }
+    if (list->tail == entry) {
+        list->tail = entry->prev;
+    }
+
+    if (entry->prev != NULL) {
+        LC_ASSERT(entry->prev->next == entry);
+        entry->prev->next = entry->next;
+    }
+    if (entry->next != NULL) {
+        LC_ASSERT(entry->next->prev == entry);
+        entry->next->prev = entry->prev;
+    }
+
+    entry->next = NULL;
+    entry->prev = NULL;
+
+    list->count--;
 }
 
 // newEntry is contained within the packet buffer so we free the whole entry by freeing entry->packet
-static int queuePacket(PRTP_FEC_QUEUE queue, PRTPFEC_QUEUE_ENTRY newEntry, int head, PRTP_PACKET packet, int length, int isParity) {
-    PRTPFEC_QUEUE_ENTRY entry;
+static bool queuePacket(PRTP_VIDEO_QUEUE queue, PRTPV_QUEUE_ENTRY newEntry, PRTP_PACKET packet, int length, bool isParity) {
+    PRTPV_QUEUE_ENTRY entry;
     
     LC_ASSERT(!isBefore16(packet->sequenceNumber, queue->nextContiguousSequenceNumber));
 
@@ -38,10 +97,10 @@ static int queuePacket(PRTP_FEC_QUEUE queue, PRTPFEC_QUEUE_ENTRY newEntry, int h
     }
     else {
         // Check for duplicates
-        entry = queue->bufferHead;
+        entry = queue->pendingFecBlockList.head;
         while (entry != NULL) {
             if (entry->packet->sequenceNumber == packet->sequenceNumber) {
-                return 0;
+                return false;
             }
 
             entry = entry->next;
@@ -57,29 +116,9 @@ static int queuePacket(PRTP_FEC_QUEUE queue, PRTPFEC_QUEUE_ENTRY newEntry, int h
     // 90 KHz video clock
     newEntry->presentationTimeMs = packet->timestamp / 90;
 
-    if (queue->bufferHead == NULL) {
-        LC_ASSERT(queue->bufferSize == 0);
-        queue->bufferHead = queue->bufferTail = newEntry;
-    }
-    else if (head) {
-        LC_ASSERT(queue->bufferSize > 0);
-        PRTPFEC_QUEUE_ENTRY oldHead = queue->bufferHead;
-        newEntry->next = oldHead;
-        LC_ASSERT(oldHead->prev == NULL);
-        oldHead->prev = newEntry;
-        queue->bufferHead = newEntry;
-    }
-    else {
-        LC_ASSERT(queue->bufferSize > 0);
-        PRTPFEC_QUEUE_ENTRY oldTail = queue->bufferTail;
-        newEntry->prev = oldTail;
-        LC_ASSERT(oldTail->next == NULL);
-        oldTail->next = newEntry;
-        queue->bufferTail = newEntry;
-    }
-    queue->bufferSize++;
+    insertEntryIntoList(&queue->pendingFecBlockList, newEntry);
 
-    return 1;
+    return true;
 }
 
 #define PACKET_RECOVERY_FAILURE()                     \
@@ -91,17 +130,17 @@ static int queuePacket(PRTP_FEC_QUEUE queue, PRTPFEC_QUEUE_ENTRY newEntry, int h
     continue
 
 // Returns 0 if the frame is completely constructed
-static int reconstructFrame(PRTP_FEC_QUEUE queue) {
-    int totalPackets = U16(queue->bufferHighestSequenceNumber - queue->bufferLowestSequenceNumber) + 1;
+static int reconstructFrame(PRTP_VIDEO_QUEUE queue) {
+    unsigned int totalPackets = U16(queue->bufferHighestSequenceNumber - queue->bufferLowestSequenceNumber) + 1;
     int ret;
     
 #ifdef FEC_VALIDATION_MODE
     // We'll need an extra packet to run in FEC validation mode, because we will
     // be "dropping" one below and recovering it using parity. However, some frames
     // are so large that FEC is disabled entirely, so don't wait for parity on those.
-    if (queue->bufferSize < queue->bufferDataPackets + (queue->fecPercentage ? 1 : 0)) {
+    if (queue->pendingFecBlockList.count < queue->bufferDataPackets + (queue->fecPercentage ? 1 : 0)) {
 #else
-    if (queue->bufferSize < queue->bufferDataPackets) {
+    if (queue->pendingFecBlockList.count < queue->bufferDataPackets) {
 #endif
         // Not enough data to recover yet
         return -1;
@@ -146,18 +185,18 @@ static int reconstructFrame(PRTP_FEC_QUEUE queue) {
     memset(marks, 1, sizeof(char) * (totalPackets));
     
     int receiveSize = StreamConfig.packetSize + MAX_RTP_HEADER_SIZE;
-    int packetBufferSize = receiveSize + sizeof(RTPFEC_QUEUE_ENTRY);
+    int packetBufferSize = receiveSize + sizeof(RTPV_QUEUE_ENTRY);
 
 #ifdef FEC_VALIDATION_MODE
     // Choose a packet to drop
-    int dropIndex = rand() % queue->bufferDataPackets;
+    unsigned int dropIndex = rand() % queue->bufferDataPackets;
     PRTP_PACKET droppedRtpPacket = NULL;
     int droppedRtpPacketLength = 0;
 #endif
 
-    PRTPFEC_QUEUE_ENTRY entry = queue->bufferHead;
+    PRTPV_QUEUE_ENTRY entry = queue->pendingFecBlockList.head;
     while (entry != NULL) {
-        int index = U16(entry->packet->sequenceNumber - queue->bufferLowestSequenceNumber);
+        unsigned int index = U16(entry->packet->sequenceNumber - queue->bufferLowestSequenceNumber);
 
 #ifdef FEC_VALIDATION_MODE
         if (index == dropIndex) {
@@ -181,7 +220,7 @@ static int reconstructFrame(PRTP_FEC_QUEUE queue) {
         entry = entry->next;
     }
 
-    int i;
+    unsigned int i;
     for (i = 0; i < totalPackets; i++) {
         if (marks[i]) {
             packets[i] = malloc(packetBufferSize);
@@ -198,17 +237,25 @@ static int reconstructFrame(PRTP_FEC_QUEUE queue) {
     // If this fails, something is probably wrong with our FEC state.
     LC_ASSERT(ret == 0);
 
+#ifdef FEC_VERBOSE
+    if (queue->bufferDataPackets != queue->receivedBufferDataPackets) {
+        Limelog("Recovered %d video data shards from frame %d\n",
+                queue->bufferDataPackets - queue->receivedBufferDataPackets,
+                queue->currentFrameNumber);
+    }
+#endif
+
 cleanup_packets:
     for (i = 0; i < totalPackets; i++) {
         if (marks[i]) {
             // Only submit frame data, not FEC packets
             if (ret == 0 && i < queue->bufferDataPackets) {
-                PRTPFEC_QUEUE_ENTRY queueEntry = (PRTPFEC_QUEUE_ENTRY)&packets[i][receiveSize];
+                PRTPV_QUEUE_ENTRY queueEntry = (PRTPV_QUEUE_ENTRY)&packets[i][receiveSize];
                 PRTP_PACKET rtpPacket = (PRTP_PACKET) packets[i];
                 rtpPacket->sequenceNumber = U16(i + queue->bufferLowestSequenceNumber);
-                rtpPacket->header = queue->bufferHead->packet->header;
-                rtpPacket->timestamp = queue->bufferHead->packet->timestamp;
-                rtpPacket->ssrc = queue->bufferHead->packet->ssrc;
+                rtpPacket->header = queue->pendingFecBlockList.head->packet->header;
+                rtpPacket->timestamp = queue->pendingFecBlockList.head->packet->timestamp;
+                rtpPacket->ssrc = queue->pendingFecBlockList.head->packet->ssrc;
                 
                 int dataOffset = sizeof(*rtpPacket);
                 if (rtpPacket->header & FLAG_EXTENSION) {
@@ -217,6 +264,9 @@ cleanup_packets:
 
                 PNV_VIDEO_PACKET nvPacket = (PNV_VIDEO_PACKET)(((char*)rtpPacket) + dataOffset);
                 nvPacket->frameIndex = queue->currentFrameNumber;
+                nvPacket->multiFecBlocks =
+                        ((queue->multiFecLastBlockNumber << 2) | queue->multiFecCurrentBlockNumber) << 4;
+                // TODO: nvPacket->multiFecFlags?
 
 #ifdef FEC_VALIDATION_MODE
                 if (i == dropIndex && droppedRtpPacket != NULL) {
@@ -230,14 +280,12 @@ cleanup_packets:
                     LC_ASSERT(droppedDataLength <= recoveredDataLength);
                     LC_ASSERT(droppedDataLength == recoveredDataLength || (nvPacket->flags & FLAG_EOF));
 
-                    // Check all NV_VIDEO_PACKET fields except fecInfo which differs in the recovered packet
+                    // Check all NV_VIDEO_PACKET fields except FEC stuff which differs in the recovered packet
                     LC_ASSERT(nvPacket->flags == droppedNvPacket->flags);
                     LC_ASSERT(nvPacket->frameIndex == droppedNvPacket->frameIndex);
                     LC_ASSERT(nvPacket->streamPacketIndex == droppedNvPacket->streamPacketIndex);
-
-                    // TODO: Investigate assertion failure here with GFE 3.20.4. The remaining fields and
-                    // video data are still recovered successfully, so this doesn't seem critical.
-                    //LC_ASSERT(memcmp(nvPacket->reserved, droppedNvPacket->reserved, sizeof(nvPacket->reserved)) == 0);
+                    LC_ASSERT(nvPacket->reserved == droppedNvPacket->reserved);
+                    LC_ASSERT(!queue->multiFecCapable || nvPacket->multiFecBlocks == droppedNvPacket->multiFecBlocks);
 
                     // Check the data itself - use memcmp() and only loop if an error is detected
                     if (memcmp(nvPacket + 1, droppedNvPacket + 1, droppedDataLength)) {
@@ -295,7 +343,7 @@ cleanup_packets:
                 // it may be a legitimate part of the H.264 bytestream.
 
                 LC_ASSERT(isBefore16(rtpPacket->sequenceNumber, queue->bufferFirstParitySequenceNumber));
-                queuePacket(queue, queueEntry, 0, rtpPacket, StreamConfig.packetSize + dataOffset, 0);
+                queuePacket(queue, queueEntry, rtpPacket, StreamConfig.packetSize + dataOffset, false);
             } else if (packets[i] != NULL) {
                 free(packets[i]);
             }
@@ -314,33 +362,11 @@ cleanup:
     return ret;
 }
 
-static void removeEntry(PRTP_FEC_QUEUE queue, PRTPFEC_QUEUE_ENTRY entry) {
-    LC_ASSERT(entry != NULL);
-    LC_ASSERT(queue->bufferSize > 0);
-    LC_ASSERT(queue->bufferHead != NULL);
-    LC_ASSERT(queue->bufferTail != NULL);
-
-    if (queue->bufferHead == entry) {
-        queue->bufferHead = entry->next;
-    }
-    if (queue->bufferTail == entry) {
-        queue->bufferTail = entry->prev;
-    }
-
-    if (entry->prev != NULL) {
-        entry->prev->next = entry->next;
-    }
-    if (entry->next != NULL) {
-        entry->next->prev = entry->prev;
-    }
-    queue->bufferSize--;
-}
-
-static void submitCompletedFrame(PRTP_FEC_QUEUE queue) {
+static void stageCompleteFecBlock(PRTP_VIDEO_QUEUE queue) {
     unsigned int nextSeqNum = queue->bufferLowestSequenceNumber;
 
-    while (queue->bufferSize > 0) {
-        PRTPFEC_QUEUE_ENTRY entry = queue->bufferHead;
+    while (queue->pendingFecBlockList.count > 0) {
+        PRTPV_QUEUE_ENTRY entry = queue->pendingFecBlockList.head;
 
         unsigned int lowestRtpSequenceNumber = entry->packet->sequenceNumber;
 
@@ -350,13 +376,13 @@ static void submitCompletedFrame(PRTP_FEC_QUEUE queue) {
 
             // Never return parity packets
             if (entry->isParity) {
-                PRTPFEC_QUEUE_ENTRY parityEntry = entry;
+                PRTPV_QUEUE_ENTRY parityEntry = entry;
 
                 // Skip this entry
                 entry = parityEntry->next;
 
                 // Remove this entry
-                removeEntry(queue, parityEntry);
+                removeEntryFromList(&queue->pendingFecBlockList, parityEntry);
 
                 // Free the entry and packet
                 free(parityEntry->packet);
@@ -366,8 +392,7 @@ static void submitCompletedFrame(PRTP_FEC_QUEUE queue) {
 
             // Check for the next packet in sequence. This will be O(1) for non-reordered packet streams.
             if (entry->packet->sequenceNumber == nextSeqNum) {
-                removeEntry(queue, entry);
-                entry->prev = entry->next = NULL;
+                removeEntryFromList(&queue->pendingFecBlockList, entry);
 
                 // To avoid having to sample the system time for each packet, we cheat
                 // and use the first packet's receive time for all packets. This ends up
@@ -376,8 +401,8 @@ static void submitCompletedFrame(PRTP_FEC_QUEUE queue) {
                 LC_ASSERT(queue->bufferFirstRecvTimeMs != 0);
                 entry->receiveTimeMs = queue->bufferFirstRecvTimeMs;
 
-                // Submit this packet for decoding. It will own freeing the entry now.
-                queueRtpPacket(entry);
+                // Move this packet to the completed FEC block list
+                insertEntryIntoList(&queue->completedFecBlockList, entry);
                 break;
             }
             else if (isBefore16(entry->packet->sequenceNumber, lowestRtpSequenceNumber)) {
@@ -398,7 +423,20 @@ static void submitCompletedFrame(PRTP_FEC_QUEUE queue) {
     }
 }
 
-int RtpfAddPacket(PRTP_FEC_QUEUE queue, PRTP_PACKET packet, int length, PRTPFEC_QUEUE_ENTRY packetEntry) {
+static void submitCompletedFrame(PRTP_VIDEO_QUEUE queue) {
+    while (queue->completedFecBlockList.count > 0) {
+        PRTPV_QUEUE_ENTRY entry = queue->completedFecBlockList.head;
+
+        // Parity packets should have been removed by stageCompleteFecBlock()
+        LC_ASSERT(!entry->isParity);
+
+        // Submit this packet for decoding. It will own freeing the entry now.
+        removeEntryFromList(&queue->completedFecBlockList, entry);
+        queueRtpPacket(entry);
+    }
+}
+
+int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry) {
     if (isBefore16(packet->sequenceNumber, queue->nextContiguousSequenceNumber)) {
         // Reject packets behind our current buffer window
         return RTPF_RET_REJECTED;
@@ -413,36 +451,100 @@ int RtpfAddPacket(PRTP_FEC_QUEUE queue, PRTP_PACKET packet, int length, PRTPFEC_
     }
 
     PNV_VIDEO_PACKET nvPacket = (PNV_VIDEO_PACKET)(((char*)packet) + dataOffset);
+
+    nvPacket->streamPacketIndex = LE32(nvPacket->streamPacketIndex);
+    nvPacket->frameIndex = LE32(nvPacket->frameIndex);
+    nvPacket->fecInfo = LE32(nvPacket->fecInfo);
+
+    // For legacy servers, we'll fixup the reserved data so that it looks like
+    // it's a single FEC frame from a multi-FEC capable server. This allows us
+    // to make our parsing logic simpler.
+    if (!queue->multiFecCapable) {
+        nvPacket->multiFecFlags = 0x10;
+        nvPacket->multiFecBlocks = 0x00;
+    }
     
     if (isBefore16(nvPacket->frameIndex, queue->currentFrameNumber)) {
         // Reject frames behind our current frame number
         return RTPF_RET_REJECTED;
     }
 
-    int fecIndex = (nvPacket->fecInfo & 0x3FF000) >> 12;
-    
+    uint32_t fecIndex = (nvPacket->fecInfo & 0x3FF000) >> 12;
+    uint8_t fecCurrentBlockNumber = (nvPacket->multiFecBlocks >> 4) & 0x3;
+
+    if (nvPacket->frameIndex == queue->currentFrameNumber && fecCurrentBlockNumber < queue->multiFecCurrentBlockNumber) {
+        // Reject FEC blocks behind our current block number
+        return RTPF_RET_REJECTED;
+    }
+
     // Reinitialize the queue if it's empty after a frame delivery or
     // if we can't finish a frame before receiving the next one.
-    if (queue->bufferSize == 0 || queue->currentFrameNumber != nvPacket->frameIndex) {
-        if (queue->currentFrameNumber != nvPacket->frameIndex && queue->bufferSize != 0) {
-            Limelog("Unrecoverable frame %d: %d+%d=%d received < %d needed\n",
-                    queue->currentFrameNumber, queue->receivedBufferDataPackets,
-                    queue->bufferSize - queue->receivedBufferDataPackets,
-                    queue->bufferSize,
-                    queue->bufferDataPackets);
+    if (queue->pendingFecBlockList.count == 0 || queue->currentFrameNumber != nvPacket->frameIndex ||
+            queue->multiFecCurrentBlockNumber != fecCurrentBlockNumber) {
+        if (queue->pendingFecBlockList.count != 0) {
+            if (queue->multiFecLastBlockNumber != 0) {
+                Limelog("Unrecoverable frame %d (block %d of %d): %d+%d=%d received < %d needed\n",
+                        queue->currentFrameNumber, queue->multiFecCurrentBlockNumber+1,
+                        queue->multiFecLastBlockNumber+1,
+                        queue->receivedBufferDataPackets,
+                        queue->pendingFecBlockList.count - queue->receivedBufferDataPackets,
+                        queue->pendingFecBlockList.count,
+                        queue->bufferDataPackets);
+
+                // If we just missed a block of this frame rather than the whole thing,
+                // we must manually advance the queue to the next frame. Parsing this
+                // frame further is not possible.
+                if (queue->currentFrameNumber == nvPacket->frameIndex) {
+                    // Discard any unsubmitted buffers from the previous frame
+                    purgeListEntries(&queue->pendingFecBlockList);
+                    purgeListEntries(&queue->completedFecBlockList);
+
+                    queue->currentFrameNumber++;
+                    queue->multiFecCurrentBlockNumber = 0;
+                    return RTPF_RET_REJECTED;
+                }
+            }
+            else {
+                Limelog("Unrecoverable frame %d: %d+%d=%d received < %d needed\n",
+                        queue->currentFrameNumber, queue->receivedBufferDataPackets,
+                        queue->pendingFecBlockList.count - queue->receivedBufferDataPackets,
+                        queue->pendingFecBlockList.count,
+                        queue->bufferDataPackets);
+            }
         }
         
+        // We must either start on the current FEC block number for the current frame,
+        // or block 0 of a new frame.
+        uint8_t expectedFecBlockNumber = (queue->currentFrameNumber == nvPacket->frameIndex ? queue->multiFecCurrentBlockNumber : 0);
+        if (fecCurrentBlockNumber != expectedFecBlockNumber) {
+            Limelog("Unrecoverable frame %d: lost FEC blocks %d to %d\n",
+                    nvPacket->frameIndex,
+                    expectedFecBlockNumber + 1,
+                    fecCurrentBlockNumber);
+
+            // Discard any unsubmitted buffers from the previous frame
+            purgeListEntries(&queue->pendingFecBlockList);
+            purgeListEntries(&queue->completedFecBlockList);
+
+            // We dropped a block of this frame, so we must skip to the next one.
+            queue->currentFrameNumber = nvPacket->frameIndex + 1;
+            queue->multiFecCurrentBlockNumber = 0;
+            return RTPF_RET_REJECTED;
+        }
+
+        // Discard any pending buffers from the previous FEC block
+        purgeListEntries(&queue->pendingFecBlockList);
+
+        // Discard any completed FEC blocks from the previous frame
+        if (queue->currentFrameNumber != nvPacket->frameIndex) {
+            purgeListEntries(&queue->completedFecBlockList);
+        }
+
         queue->currentFrameNumber = nvPacket->frameIndex;
-        
-        // Discard any unsubmitted buffers from the previous frame
-        while (queue->bufferHead != NULL) {
-            PRTPFEC_QUEUE_ENTRY entry = queue->bufferHead;
-            queue->bufferHead = entry->next;
-            free(entry->packet);
-        }
-        
-        queue->bufferTail = NULL;
-        queue->bufferSize = 0;
+
+        // Tell the control stream logic about this frame, even if we don't end up
+        // being able to reconstruct a full frame from it.
+        connectionSawFrame(queue->currentFrameNumber);
         
         queue->bufferFirstRecvTimeMs = PltGetMillis();
         queue->bufferLowestSequenceNumber = U16(packet->sequenceNumber - fecIndex);
@@ -453,6 +555,8 @@ int RtpfAddPacket(PRTP_FEC_QUEUE queue, PRTP_PACKET packet, int length, PRTPFEC_
         queue->bufferParityPackets = (queue->bufferDataPackets * queue->fecPercentage + 99) / 100;
         queue->bufferFirstParitySequenceNumber = U16(queue->bufferLowestSequenceNumber + queue->bufferDataPackets);
         queue->bufferHighestSequenceNumber = U16(queue->bufferFirstParitySequenceNumber + queue->bufferParityPackets - 1);
+        queue->multiFecCurrentBlockNumber = fecCurrentBlockNumber;
+        queue->multiFecLastBlockNumber = (nvPacket->multiFecBlocks >> 6) & 0x3;
     } else if (isBefore16(queue->bufferHighestSequenceNumber, packet->sequenceNumber)) {
         // In rare cases, we get extra parity packets. It's rare enough that it's probably
         // not worth handling, so we'll just drop them.
@@ -463,8 +567,16 @@ int RtpfAddPacket(PRTP_FEC_QUEUE queue, PRTP_PACKET packet, int length, PRTPFEC_
     LC_ASSERT((nvPacket->fecInfo & 0xFF0) >> 4 == queue->fecPercentage);
     LC_ASSERT((nvPacket->fecInfo & 0xFFC00000) >> 22 == queue->bufferDataPackets);
 
+    // Verify that the legacy non-multi-FEC compatibility code works
+    LC_ASSERT(queue->multiFecCapable || fecCurrentBlockNumber == 0);
+    LC_ASSERT(queue->multiFecCapable || queue->multiFecLastBlockNumber == 0);
+
+    // Multi-block FEC details must remain the same within a single frame
+    LC_ASSERT(fecCurrentBlockNumber == queue->multiFecCurrentBlockNumber);
+    LC_ASSERT(((nvPacket->multiFecBlocks >> 6) & 0x3) == queue->multiFecLastBlockNumber);
+
     LC_ASSERT((nvPacket->flags & FLAG_EOF) || length - dataOffset == StreamConfig.packetSize);
-    if (!queuePacket(queue, packetEntry, 0, packet, length, !isBefore16(packet->sequenceNumber, queue->bufferFirstParitySequenceNumber))) {
+    if (!queuePacket(queue, packetEntry, packet, length, !isBefore16(packet->sequenceNumber, queue->bufferFirstParitySequenceNumber))) {
         return RTPF_RET_REJECTED;
     }
     else {
@@ -475,16 +587,33 @@ int RtpfAddPacket(PRTP_FEC_QUEUE queue, PRTP_PACKET packet, int length, PRTPFEC_
         // Try to submit this frame. If we haven't received enough packets,
         // this will fail and we'll keep waiting.
         if (reconstructFrame(queue) == 0) {
-            // Submit the frame data to the depacketizer
-            submitCompletedFrame(queue);
+            // Stage the complete FEC block for use once reassembly is complete
+            stageCompleteFecBlock(queue);
             
-            // submitCompletedFrame() should have consumed all data
-            LC_ASSERT(queue->bufferHead == NULL);
-            LC_ASSERT(queue->bufferTail == NULL);
-            LC_ASSERT(queue->bufferSize == 0);
+            // stageCompleteFecBlock() should have consumed all pending FEC data
+            LC_ASSERT(queue->pendingFecBlockList.head == NULL);
+            LC_ASSERT(queue->pendingFecBlockList.tail == NULL);
+            LC_ASSERT(queue->pendingFecBlockList.count == 0);
             
-            // Ignore any more packets for this frame
-            queue->currentFrameNumber++;
+            // If we're not yet at the last FEC block for this frame, move on to the next block.
+            // Otherwise, the frame is complete and we can move on to the next frame.
+            if (queue->multiFecCurrentBlockNumber < queue->multiFecLastBlockNumber) {
+                // Move on to the next FEC block for this frame
+                queue->multiFecCurrentBlockNumber++;
+            }
+            else {
+                // Submit all FEC blocks to the depacketizer
+                submitCompletedFrame(queue);
+
+                // submitCompletedFrame() should have consumed all completed FEC data
+                LC_ASSERT(queue->completedFecBlockList.head == NULL);
+                LC_ASSERT(queue->completedFecBlockList.tail == NULL);
+                LC_ASSERT(queue->completedFecBlockList.count == 0);
+
+                // Continue to the next frame
+                queue->currentFrameNumber++;
+                queue->multiFecCurrentBlockNumber = 0;
+            }
         }
 
         return RTPF_RET_QUEUED;
